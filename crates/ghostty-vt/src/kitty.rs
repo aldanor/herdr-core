@@ -2,14 +2,15 @@
 //! viewers show, and the commands that put those images back on a viewer.
 
 use super::{Terminal, ffi};
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Image data one screen keeps. Past it the oldest images go; a bigger one is refused.
@@ -26,6 +27,9 @@ pub(crate) const PAINT_BYTES: usize = 5 << 20;
 /// Images and placements one paint may carry, however small: replaying each costs time under the lock.
 const PAINT_IMAGES: usize = 256;
 const PAINT_PLACEMENTS: usize = 1024;
+/// How many bytes of pixels a paint may encode on the spot, under the lock: about 5 ms
+/// at worst, so icons need no second paint. The rest go to the encoder.
+pub(crate) const INLINE_PIXELS: usize = 64 << 10;
 /// Ends a chunked load a viewer may still have open (a dropped backlog):
 /// otherwise it would take the next transmission for its continuation.
 pub(crate) const END_LOAD: &[u8] = b"\x1b_Gq=2,m=0;\x1b\\";
@@ -33,6 +37,7 @@ const CHUNK: usize = 4096;
 const OPT_DECODE_PNG: i32 = 1;
 const DATA_KITTY_GRAPHICS: i32 = 30;
 const GRAPHICS_PLACEMENTS: i32 = 1;
+const GRAPHICS_GENERATION: i32 = 2;
 const PLACEMENT_IMAGE: i32 = 1;
 const PLACEMENT_ID: i32 = 2;
 const PLACEMENT_VIRTUAL: i32 = 3;
@@ -54,6 +59,8 @@ const DECODE_SHARE: f64 = 0.4;
 const DECODE_SAVED: f64 = 0.4;
 /// Ghostty refuses an image longer than this on either side, but only after decoding it.
 const GHOSTTY_MAX_SIDE: u32 = 10000;
+/// Longer than this under the lock is stopped: no image is worth it.
+const DECODE_MOST: f64 = 0.5;
 /// A debug build takes this much longer, and shouldn't refuse what a release wouldn't.
 const DECODE_BUILD: f64 = if cfg!(debug_assertions) { 30.0 } else { 1.0 };
 
@@ -125,6 +132,43 @@ impl DecodeBudget {
 
 static DECODE_BUDGET: Mutex<DecodeBudget> = Mutex::new(DecodeBudget::new());
 
+/// Hands a decoder its file in small pieces, and none past `until`: the file is what
+/// it spends its time on when a crafted one takes far longer than its size suggests.
+struct Paced<'a> {
+    file: std::io::Cursor<&'a [u8]>,
+    until: Instant,
+}
+
+impl std::io::Read for Paced<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let piece = self.fill_buf()?;
+        let n = piece.len().min(out.len());
+        out[..n].copy_from_slice(&piece[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for Paced<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if Instant::now() >= self.until {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let rest = self.file.fill_buf()?;
+        Ok(&rest[..rest.len().min(64 << 10)])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.file.consume(n);
+    }
+}
+
+impl std::io::Seek for Paced<'_> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(to)
+    }
+}
+
 pub(crate) fn install_decoder() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe {
@@ -165,7 +209,8 @@ fn decode(
     took: impl FnOnce(Instant) -> f64,
     budget: &Mutex<DecodeBudget>,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    let mut decoder = png_decoder(bytes);
+    let until = now + std::time::Duration::from_secs_f64(DECODE_MOST * DECODE_BUILD);
+    let mut decoder = png_decoder(bytes, until);
     // Before any allocation: a tiny file can claim gigabytes of pixels.
     let header = decoder.read_header_info().ok()?;
     if header.width as u64 * header.height as u64 * 4 > STORAGE_BYTES
@@ -184,15 +229,15 @@ fn decode(
     decoded
 }
 
-fn png_decoder(bytes: &[u8]) -> png::Decoder<std::io::Cursor<&[u8]>> {
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    // Metadata no one reads.
+fn png_decoder(bytes: &[u8], until: Instant) -> png::Decoder<Paced<'_>> {
+    let mut decoder = png::Decoder::new(Paced { file: std::io::Cursor::new(bytes), until });
+    // Metadata no one reads, whose decompression wouldn't look at the clock.
     decoder.set_ignore_iccp_chunk(true);
     decoder.set_ignore_text_chunk(true);
     decoder
 }
 
-fn decode_pixels(mut decoder: png::Decoder<std::io::Cursor<&[u8]>>) -> Option<(u32, u32, Vec<u8>)> {
+fn decode_pixels(mut decoder: png::Decoder<Paced>) -> Option<(u32, u32, Vec<u8>)> {
     // Every format comes out as one of the two below.
     decoder.set_transformations(png::Transformations::STRIP_16 | png::Transformations::ALPHA);
     let mut reader = decoder.read_info().ok()?;
@@ -251,10 +296,52 @@ pub(crate) enum Encoded {
 #[derive(Default)]
 pub(crate) struct Replay {
     pub carried: Carried,
+    /// Those it carried, sorted, by generation.
+    pub images: Arc<[u64]>,
+    /// The images still to encode, first wanted first: each with its generation.
+    pub wanted: Vec<(u32, u64)>,
     /// Need the cursor: they go before the screen's modes are final.
     pub direct: Vec<u8>,
     /// Don't: they follow the whole screen, so it never waits for large ones. Output after them does.
     pub placeholder: Vec<u8>,
+}
+
+/// An image to encode away from the screen.
+pub struct EncodeJob {
+    id: u32,
+    width: u32,
+    height: u32,
+    format: i32,
+    generation: u64,
+    pixels: Vec<u8>,
+}
+
+/// What came of it.
+pub struct EncodedImage {
+    generation: u64,
+    commands: Option<Vec<u8>>,
+}
+
+impl EncodeJob {
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub fn run(self) -> EncodedImage {
+        let generation = self.generation;
+        let image = Image {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            generation,
+            data: self.pixels.as_ptr(),
+            len: self.pixels.len(),
+        };
+        let commands = catch_unwind(AssertUnwindSafe(|| encode(&image, PAINT_BYTES))).ok().flatten();
+        EncodedImage { generation, commands }
+    }
 }
 
 /// What a paint with images brought a viewer, and what it couldn't.
@@ -262,8 +349,43 @@ pub(crate) struct Replay {
 pub struct Carried {
     /// Which images: two paints with the same ones can only differ in what's live anyway.
     pub images: u64,
-    /// Some on screen stayed behind for lack of room.
+    /// Some wait for the encoder: a later paint will have more.
+    pub deferred: bool,
+    /// Some on screen stayed behind for lack of room. While others are deferred, it
+    /// may only be that they haven't been looked at.
     pub refused: bool,
+}
+
+/// What a viewer was left with of one screen's images by a paint: of those up to `upto`,
+/// only `images`. It got any others from the live stream. Generations come from one
+/// counter, a screen's and its images' alike, so they can be compared.
+#[derive(Clone)]
+pub struct Given {
+    upto: u64,
+    images: Arc<[u64]>,
+    carried: Option<u64>,
+}
+
+impl Given {
+    /// None of the images there are by `upto`.
+    pub fn nothing(upto: u64) -> Given {
+        Given { upto, images: Arc::new([]), carried: None }
+    }
+
+    /// Whether it doesn't have any of these (from `placed_images`).
+    pub fn lacks(&self, placed: &[u64]) -> bool {
+        placed.iter().any(|image| *image <= self.upto && self.images.binary_search(image).is_err())
+    }
+
+    /// What the paint carried, for comparing with another.
+    pub fn carried(&self) -> Option<u64> {
+        self.carried
+    }
+
+    /// The same moment, for a paint without images.
+    pub fn without_images(&self) -> Given {
+        Given::nothing(self.upto)
+    }
 }
 
 impl Terminal {
@@ -335,10 +457,32 @@ impl Terminal {
         self.placements().iter().any(|p| p.virtual_ || p.visible)
     }
 
-    pub(crate) fn images_vt(&self) -> Replay {
-        let replay = self.images_walk(PAINT_BYTES, true);
+    pub(crate) fn images_vt(&self, inline_pixels: usize) -> Replay {
+        let replay = self.images_walk(PAINT_BYTES, inline_pixels, true);
         self.carried.set(replay.carried);
+        *self.carried_images.borrow_mut() = replay.images.clone();
         replay
+    }
+
+    /// Changes with any image or placement on this screen, though not when they scroll.
+    pub fn images_generation(&self) -> u64 {
+        let mut generation = 0u64;
+        unsafe { ghostty_kitty_graphics_get(self.graphics(), GRAPHICS_GENERATION, (&raw mut generation).cast()) };
+        generation
+    }
+
+    /// Where the placements are: 0 with none. Changes when they scroll, which
+    /// `images_generation` doesn't.
+    pub fn image_places(&self) -> u64 {
+        let mut placements: Vec<_> = self.placements().iter().map(|p| (p.row, p.col, p.cells)).collect();
+        if placements.is_empty() {
+            return 0;
+        }
+        // In the same places is the same, whatever order the screen keeps them in.
+        placements.sort_unstable();
+        let mut places = std::collections::hash_map::DefaultHasher::new();
+        placements.hash(&mut places);
+        places.finish().max(1)
     }
 
     /// Whether a viewer has to place any image by where the text left it.
@@ -352,9 +496,70 @@ impl Terminal {
         self.carried.get()
     }
 
-    /// Finds what a paint now would carry (`images_carried`).
-    pub fn look_at_images(&self) {
-        self.carried.set(self.images_walk(PAINT_BYTES, false).carried);
+    /// What a viewer has of this screen's images once sent that paint.
+    pub fn images_given(&self) -> Given {
+        Given {
+            upto: self.images_generation(),
+            images: self.carried_images.borrow().clone(),
+            carried: Some(self.carried.get().images),
+        }
+    }
+
+    /// The images a paint would bring, by generation.
+    pub fn placed_images(&self) -> Vec<u64> {
+        let placements = self.placements();
+        let shown = placements.iter().filter(|p| p.virtual_ || p.visible);
+        shown.filter_map(|p| Some(self.image(p.image)?.generation)).collect()
+    }
+
+    /// These images, by generation.
+    pub fn images_named(&self, ids: &[u32]) -> Vec<u64> {
+        ids.iter().filter_map(|id| Some(self.image(*id)?.generation)).collect()
+    }
+
+    /// Whether a paint now would carry all it could, with no more to encode.
+    pub fn images_ready(&self) -> bool {
+        let replay = self.images_walk(PAINT_BYTES, self.inline_pixels.get(), false);
+        self.carried.set(replay.carried);
+        *self.carried_images.borrow_mut() = replay.images;
+        !replay.carried.deferred
+    }
+
+    /// Whether the encoder is at work on this screen.
+    pub fn encoding(&self) -> bool {
+        self.encoding.get()
+    }
+
+    pub fn set_encoding(&self, encoding: bool) {
+        self.encoding.set(encoding);
+    }
+
+    /// The next image for the encoder, with its own copy of the pixels. That and looking
+    /// through the placements are what it does under the lock.
+    pub fn next_encode(&self) -> Option<EncodeJob> {
+        let wanted = self.images_walk(PAINT_BYTES, 0, false).wanted;
+        // What's wanted most and what's waited longest, in turn. A generation holds still while
+        // an image waits, so however many keep changing, one that doesn't soon gets to the front.
+        let oldest = self.encode_oldest.replace(!self.encode_oldest.get() && !wanted.is_empty());
+        let next = if oldest { wanted.iter().min_by_key(|image| image.1) } else { wanted.first() };
+        let &(id, _) = next?;
+        let image = self.image(id).filter(|image| !image.data.is_null())?;
+        let pixels = unsafe { std::slice::from_raw_parts(image.data, image.len) }.to_vec();
+        Some(EncodeJob {
+            id,
+            width: image.width,
+            height: image.height,
+            format: image.format,
+            generation: image.generation,
+            pixels,
+        })
+    }
+
+    /// Keeps what the encoder made, for the screen in view. An image gone by now, or on the
+    /// other screen, is forgotten at that screen's next paint.
+    pub fn encoded(&self, image: EncodedImage) {
+        let encoded = image.commands.map_or(Encoded::TooBig(PAINT_BYTES + 1), Encoded::Commands);
+        self.encoded[self.alt_screen() as usize].borrow_mut().insert(image.generation, encoded);
     }
 
     /// How many times the placements have been walked. For tests: with hundreds of them
@@ -364,11 +569,17 @@ impl Terminal {
         self.placement_walks.get()
     }
 
+    /// How many bytes of pixels a paint may encode on the spot. For tests: nothing else should need it.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_inline_pixels(&self, bytes: usize) {
+        self.inline_pixels.set(bytes);
+    }
+
     /// The commands for the images on screen, within `budget` bytes. Each image goes whole
     /// or not at all: direct ones on screen first, then placeholder ones, newest first in
     /// each, as the screen itself evicts. `emit`: copy out the commands too, not just find
     /// out what they'd be.
-    pub(crate) fn images_walk(&self, budget: usize, emit: bool) -> Replay {
+    pub(crate) fn images_walk(&self, budget: usize, inline_pixels: usize, emit: bool) -> Replay {
         let placements = self.placements();
         let newest = |p: &&ImagePlacement| Reverse(self.image(p.image).map_or(0, |i| i.generation));
         let mut direct: Vec<&ImagePlacement> = placements.iter().filter(|p| !p.virtual_ && p.visible).collect();
@@ -386,7 +597,20 @@ impl Terminal {
         let mut placements_refused = false;
         let mut carried = Vec::new();
         let mut replay = Replay::default();
+        let (mut deferred, mut wanted, waiting) = (false, Vec::new(), Cell::new(0));
+        let mut inline_left = inline_pixels;
         let cell = self.hooks.cell;
+        let mut encode_now = |image: &Image| {
+            let now = image.len <= inline_left;
+            if now {
+                inline_left -= image.len;
+            } else {
+                deferred = true;
+                waiting.set(waiting.get() + 1);
+                wanted.push((image.id, image.generation));
+            }
+            now
+        };
         for (list, out) in [(&direct, &mut replay.direct), (&placeholder, &mut replay.placeholder)] {
             let mut placed = Vec::new();
             let mut newest_first = Vec::new();
@@ -395,9 +619,9 @@ impl Terminal {
                     if refused.contains(&p.image) {
                         continue;
                     }
-                    let fits = sent.len() < PAINT_IMAGES
+                    let fits = sent.len() + waiting.get() < PAINT_IMAGES
                         && self.image(p.image).is_some_and(|image| {
-                            let fits = transmit(&image, &mut cache, &mut kept, &mut left, &mut effort);
+                            let fits = transmit(&image, &mut cache, &mut kept, &mut left, &mut effort, &mut encode_now);
                             if fits {
                                 newest_first.push(image.generation);
                             }
@@ -433,7 +657,10 @@ impl Terminal {
         carried.sort_unstable();
         let mut images = std::collections::hash_map::DefaultHasher::new();
         carried.hash(&mut images);
-        replay.carried = Carried { images: images.finish(), refused: placements_refused || !refused.is_empty() };
+        replay.images = carried.into();
+        replay.wanted = wanted;
+        replay.carried =
+            Carried { images: images.finish(), deferred, refused: placements_refused || !refused.is_empty() };
         replay
     }
 }
@@ -444,6 +671,7 @@ fn transmit(
     kept: &mut HashMap<u64, Encoded>,
     left: &mut usize,
     effort: &mut usize,
+    encode_now: &mut impl FnMut(&Image) -> bool,
 ) -> bool {
     let commands = match cache.remove(&image.generation) {
         Some(Encoded::Commands(commands)) => Some(commands),
@@ -451,7 +679,10 @@ fn transmit(
             kept.insert(image.generation, Encoded::TooBig(size));
             return false;
         }
-        _ if *effort == 0 => return false,
+        // Budget spent: it may fit another time, and encoding now would be wasted.
+        _ if *left == 0 || *effort == 0 => return false,
+        // Not this paint, then: nothing's known about it, so the next tries.
+        _ if !encode_now(image) => return false,
         _ => {
             let limit = (*left).min(*effort);
             let commands = catch_unwind(AssertUnwindSafe(|| encode(image, limit))).ok().flatten();

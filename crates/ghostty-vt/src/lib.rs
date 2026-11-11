@@ -6,7 +6,7 @@ use std::ptr;
 mod kitty;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
-pub use kitty::Carried;
+pub use kitty::{Carried, EncodeJob, EncodedImage, Given};
 
 mod ffi {
     use std::ffi::c_void;
@@ -320,8 +320,12 @@ pub struct Terminal {
     /// screen and the alternate one: painting one doesn't make the other's go.
     encoded: [std::cell::RefCell<std::collections::HashMap<u64, kitty::Encoded>>; 2],
     carried: std::cell::Cell<kitty::Carried>,
+    carried_images: std::cell::RefCell<std::sync::Arc<[u64]>>,
     #[cfg(any(test, feature = "test-hooks"))]
     placement_walks: std::cell::Cell<u64>,
+    inline_pixels: std::cell::Cell<usize>,
+    encoding: std::cell::Cell<bool>,
+    encode_oldest: std::cell::Cell<bool>,
 }
 
 // The handle is only touched through `&mut self` / `&self`; libghostty keeps no thread state.
@@ -421,8 +425,12 @@ impl Terminal {
             hooks,
             encoded: Default::default(),
             carried: Default::default(),
+            carried_images: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             placement_walks: Default::default(),
+            inline_pixels: std::cell::Cell::new(kitty::INLINE_PIXELS),
+            encoding: Default::default(),
+            encode_oldest: Default::default(),
         };
         let ud: *const Hooks = &*term.hooks;
         let continuation = CONTINUATION_MAX_BYTES;
@@ -727,20 +735,33 @@ impl Terminal {
 
     /// Bytes that repaint this terminal on a fresh viewer: up to `history`
     /// scrollback lines (main screen only), then the screen with its modes,
-    /// cursor, title and images.
-    pub fn paint(&self, history: usize) -> Vec<u8> {
-        self.paint_with(history, self.images_vt(), Clearing::Images)
+    /// cursor, title and images, leaving larger ones not yet encoded to the encoder,
+    /// for a later paint.
+    pub fn paint_ready(&self, history: usize) -> Vec<u8> {
+        self.paint_with(history, self.images_vt(self.inline_pixels.get()), Clearing::Images)
     }
 
-    /// `paint` for a viewer already showing this screen.
+    /// `paint_ready` for a viewer already showing this screen.
+    pub fn repaint_ready(&self) -> Vec<u8> {
+        self.paint_with(0, self.images_vt(self.inline_pixels.get()), Clearing::ImagesAgain)
+    }
+
+    /// `repaint_ready` that encodes all its images on the spot: no later paint will.
     pub fn repaint(&self) -> Vec<u8> {
-        self.paint_with(0, self.images_vt(), Clearing::ImagesAgain)
+        self.paint_with(0, self.images_vt(usize::MAX), Clearing::ImagesAgain)
     }
 
-    /// `paint` without images, for when they'd only have to be sent again. A
+    /// `paint_ready` without images, for when they'd only have to be sent again. A
     /// viewer keeps the placeholder ones it has; direct ones in view are cleared.
     pub fn paint_text(&self, history: usize) -> Vec<u8> {
         self.paint_with(history, kitty::Replay::default(), Clearing::Screen)
+    }
+
+    /// `paint_ready` for a viewer that has missed nothing and has its images where the screen does.
+    /// Most of what they are, a replay can't say: numbers, relative placements, which ids
+    /// came from the program. So this redraws only the text, and leaves them and any load be.
+    pub fn paint_keeping_images(&self) -> Vec<u8> {
+        self.paint_with(0, kitty::Replay::default(), Clearing::Nothing)
     }
 
     pub(crate) fn paint_with(&self, history: usize, images: kitty::Replay, clearing: Clearing) -> Vec<u8> {
@@ -754,39 +775,45 @@ impl Terminal {
             .to_vec();
         // At a prompt, a viewer takes the lines to come for more of it, and a terminal that
         // lets the shell redraw its prompt would clear them from there at its next resize.
-        if clearing == Clearing::ImagesAgain {
+        if matches!(clearing, Clearing::Nothing | Clearing::ImagesAgain) {
             out.extend(b"\x1b]133;C\x1b\\");
         }
         // A first paint with no image to bring has no call on what a used terminal holds.
         let clearing = if clearing == Clearing::Images && !self.has_images() { Clearing::Screen } else { clearing };
-        // The formatter only exposes the active screen. Leave alternate mode
-        // on a snapshot so the viewer also gets its hidden primary screen,
-        // without changing the live terminal or consuming its partial VT input.
-        // Its text only: a viewer gets its images once the program goes back there.
-        if self.alt_screen()
+        if clearing == Clearing::Nothing {
+            // On this screen already, and leaving it would clear the alternate one. `CSI 2J`
+            // would take its images too, even the ones in no place on it.
+            out.extend(b"\x1b]8;;\x1b\\\x1b[H\x1b[J");
+        } else if self.alt_screen()
             && let Some(snapshot) = self.snapshot()
             && let Some(mut primary) = Self::restore(&snapshot, usize::MAX)
         {
+            // The formatter only exposes the active screen. Leave alternate mode
+            // on a snapshot so the viewer also gets its hidden primary screen,
+            // without changing the live terminal or consuming its partial VT input.
+            // Its text only: a viewer gets its images once the program goes back there.
             primary.write(b"\x18\x1b[?1049l");
             out.extend(primary.paint_text(history));
-        } else {
-            out.extend(b"\x1b[?1049l\x1b[?1047l\x1b[?47l");
-            start_screen(&mut out, if self.alt_screen() { Clearing::Screen } else { clearing });
-        }
-        let available = self.history_rows();
-        if history > 0 && available > 0 && !self.alt_screen() {
-            let from = available.saturating_sub(history as u32);
-            if let Some(sel) = self.select(ffi::POINT_HISTORY, (0, from), (last.0, available - 1)) {
-                out.extend(self.format(ffi::FORMAT_VT, Some(&sel), false));
-                // Push those lines up into the viewer's scrollback before painting the screen.
-                out.extend(b"\x1b[0m\r\n".iter().chain(&b"\n".repeat(rows as usize)));
-                out.extend(b"\x1b[H\x1b[2J");
-            }
-        }
-        if self.alt_screen() {
             // The primary screen's pen, margins and charsets must not leak into this one.
             out.extend(b"\x1b[?1049h\x1b[!p");
             start_screen(&mut out, clearing);
+        } else {
+            out.extend(b"\x1b[?1049l\x1b[?1047l\x1b[?47l");
+            start_screen(&mut out, if self.alt_screen() { Clearing::Screen } else { clearing });
+            let available = self.history_rows();
+            if history > 0 && available > 0 && !self.alt_screen() {
+                let from = available.saturating_sub(history as u32);
+                if let Some(sel) = self.select(ffi::POINT_HISTORY, (0, from), (last.0, available - 1)) {
+                    out.extend(self.format(ffi::FORMAT_VT, Some(&sel), false));
+                    // Push those lines up into the viewer's scrollback before painting the screen.
+                    out.extend(b"\x1b[0m\r\n".iter().chain(&b"\n".repeat(rows as usize)));
+                    out.extend(b"\x1b[H\x1b[2J");
+                }
+            }
+            if self.alt_screen() {
+                out.extend(b"\x1b[?1049h\x1b[!p");
+                start_screen(&mut out, clearing);
+            }
         }
         let screen = self.select(ffi::POINT_ACTIVE, (0, 0), last);
         if let Some(sel) = screen.as_ref().filter(|_| !images.direct.is_empty()) {
@@ -865,12 +892,9 @@ impl Drop for Terminal {
 /// would spread over all that follows.
 fn start_screen(out: &mut Vec<u8>, clearing: Clearing) {
     out.extend(kitty::END_LOAD);
-    match clearing {
+    if matches!(clearing, Clearing::Images | Clearing::ImagesAgain) {
         // By id: `d=A` only takes what's visible, and placeholder images aren't.
-        Clearing::Images => out.extend(b"\x1b_Ga=d,d=R,x=1,y=4294967295,q=2\x1b\\"),
-        // What's in view. What a viewer still holds, the program may still name.
-        Clearing::ImagesAgain => out.extend(b"\x1b_Ga=d,d=a,q=2\x1b\\"),
-        Clearing::Screen => {}
+        out.extend(b"\x1b_Ga=d,d=R,x=1,y=4294967295,q=2\x1b\\");
     }
     // At a marked prompt, `CSI 2J` scrolls the screen into history first, which is what
     // anything a viewer showed before a first paint should do, but again and again it piles up.
@@ -884,6 +908,8 @@ fn start_screen(out: &mut Vec<u8>, clearing: Clearing) {
 /// What a paint clears besides the text it replaces.
 #[derive(Clone, Copy, PartialEq)]
 enum Clearing {
+    /// No image at all.
+    Nothing,
     /// What's in view goes with the screen, as it would for a program's own clear.
     Screen,
     /// Every image: the paint brings those that fit, and of one it can't

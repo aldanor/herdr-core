@@ -2,6 +2,7 @@
 //! Channel 0 carries JSON-RPC messages; attach streams get their own channels.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const HEADER: usize = 9;
@@ -29,6 +30,11 @@ pub const MAX_PENDING: usize = 4 << 20;
 /// Replies kept for a client that stopped reading; past it, it is dropped.
 pub const MAX_CONTROL: usize = 64 << 20;
 const CHUNK: usize = 16 * 1024;
+/// After a paint with images, the next waits this many times as long as it took, so
+/// that they take about a fifth of the line's time: more for one past 7.5 s, as the
+/// wait stops there, and counting any time the viewer stalled for.
+const IMAGE_PAINT_SHARE: u32 = 4;
+const IMAGE_PAINT_WAIT_MOST: Duration = Duration::from_secs(30);
 
 pub fn encode(channel: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + payload.len());
@@ -153,6 +159,18 @@ struct Stream {
     ending: Option<Vec<u8>>,
     /// Paint bytes still at the head of `pending`: they don't count as falling behind.
     paint_left: usize,
+    /// Image commands or a switch of screen are among what's queued: a viewer can't
+    /// lose those and stay whole.
+    images_queued: bool,
+    /// When the paint with images going out started.
+    image_paint_at: Option<Instant>,
+    /// No other paint with images before this.
+    images_after: Option<Instant>,
+    /// What's gone out and what's been acknowledged, and how far the last paint goes: it
+    /// hasn't arrived before that. A viewer's opening credit only makes this say so sooner.
+    sent: u64,
+    credited: u64,
+    paint_end: u64,
 }
 
 /// What one connection still has to send. Control frames always go first;
@@ -191,6 +209,12 @@ impl Outbox {
                 credit: WINDOW,
                 ending: None,
                 paint_left: 0,
+                images_queued: false,
+                image_paint_at: None,
+                images_after: None,
+                sent: 0,
+                credited: 0,
+                paint_end: 0,
             },
         );
     }
@@ -216,12 +240,40 @@ impl Outbox {
         self.can_send(channel) && self.streams.get(&channel).is_some_and(|s| s.paint_left == 0)
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_images_until(&mut self, channel: u32, until: Option<Instant>) {
+        self.streams.get_mut(&channel).expect("open stream").images_after = until;
+    }
+
+    /// How long until another paint with images is welcome.
+    pub fn images_wait(&self, channel: u32, now: Instant) -> Duration {
+        let after = self.streams.get(&channel).and_then(|s| s.images_after);
+        after.map_or(Duration::ZERO, |after| after.saturating_duration_since(now))
+    }
+
+    /// Whether any of a paint has yet to reach the viewer.
+    pub fn painting(&self, channel: u32) -> bool {
+        self.streams.get(&channel).is_some_and(|s| s.credited < s.paint_end)
+    }
+
+    pub fn images_queued(&self, channel: u32) -> bool {
+        self.streams.get(&channel).is_some_and(|s| s.images_queued)
+    }
+
+    pub fn queued_images(&mut self, channel: u32) {
+        if let Some(s) = self.streams.get_mut(&channel) {
+            s.images_queued = true;
+        }
+    }
+
     /// Supersede pending output with a new grid and an authoritative repaint.
     /// A partly delivered escape sequence is cancelled by the repaint's CAN.
     pub fn resize(&mut self, channel: u32, size: &[u8]) {
         if let Some(s) = self.streams.get_mut(&channel) {
             s.pending.clear();
             s.paint_left = 0;
+            s.images_queued = false;
+            s.image_paint_at = None;
             s.resizes.clear();
             s.resizes.push_back((0, size.to_vec()));
         }
@@ -257,6 +309,7 @@ impl Outbox {
             // A paint already on its way finishes: starting over would never end
             // for a viewer slower than the program. Only what followed it goes.
             s.pending.truncate(s.paint_left);
+            s.images_queued = false;
             let latest = s.resizes.pop_back();
             s.resizes.clear();
             if let Some((_, size)) = latest {
@@ -275,6 +328,19 @@ impl Outbox {
         s.pending.clear();
         s.pending.extend(bytes);
         s.paint_left = bytes.len();
+        s.paint_end = s.sent + bytes.len() as u64;
+        s.images_queued = false;
+        s.image_paint_at = None;
+    }
+
+    /// `paint`, timed: on a slow line these are what typing waits behind, so the
+    /// next waits long enough to leave most of the line's time to everything else.
+    pub fn paint_with_images(&mut self, channel: u32, bytes: &[u8]) {
+        self.paint(channel, bytes);
+        if let Some(s) = self.streams.get_mut(&channel) {
+            s.image_paint_at = Some(Instant::now());
+            s.images_queued = true;
+        }
     }
 
     /// `data` for a stream of whole lines (events): too far behind, it keeps
@@ -298,6 +364,7 @@ impl Outbox {
     pub fn credit(&mut self, channel: u32, bytes: usize) {
         if let Some(s) = self.streams.get_mut(&channel) {
             s.credit = s.credit.saturating_add(bytes);
+            s.credited = s.credited.saturating_add(bytes as u64);
         }
     }
 
@@ -331,8 +398,16 @@ impl Outbox {
             *at -= n;
         }
         s.credit -= n;
+        s.sent += n as u64;
         s.paint_left = s.paint_left.saturating_sub(n);
+        if s.paint_left == 0
+            && let Some(at) = s.image_paint_at.take()
+        {
+            let now = Instant::now();
+            s.images_after = Some(now + (now - at).saturating_mul(IMAGE_PAINT_SHARE).min(IMAGE_PAINT_WAIT_MOST));
+        }
         let chunk: Vec<u8> = s.pending.drain(..n).collect();
+        s.images_queued &= !s.pending.is_empty();
         // A paint can be large: an idle stream shouldn't keep its buffer.
         if s.pending.is_empty() && s.pending.capacity() > WINDOW {
             s.pending = VecDeque::new();
@@ -400,17 +475,45 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_leaves_the_wait_a_paint_with_images_earned() {
+        let mut out = Outbox::default();
+        out.open(1);
+        let now = Instant::now();
+        out.hold_images_until(1, Some(now + Duration::from_secs(20)));
+        out.resize(1, &[80, 0, 24, 0]);
+        assert_eq!(out.images_wait(1, now), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn the_wait_after_a_paint_starts_from_its_last_byte() {
+        let mut out = Outbox::default();
+        out.open(1);
+        out.paint_with_images(1, &vec![b'p'; WINDOW + 1]);
+        out.streams.get_mut(&1).unwrap().image_paint_at = Some(Instant::now() - Duration::from_secs(5));
+        while out.next_frame().is_some() {}
+        assert!(out.streams[&1].images_after.is_none(), "one byte is still waiting for credit");
+        out.credit(1, 1);
+        assert!(out.next_frame().is_some());
+        assert!(out.images_wait(1, Instant::now()) >= Duration::from_secs(19));
+    }
+
+    #[test]
     fn a_paint_is_on_its_way_until_the_viewer_says_it_has_it() {
         let mut out = Outbox::default();
         out.open(1);
         out.data(1, b"before");
         drain(&mut out);
         out.paint(1, b"paint");
+        assert!(out.painting(1));
         drain(&mut out);
+        assert!(out.painting(1), "sent isn't there yet");
         out.credit(1, 6);
+        assert!(out.painting(1), "that was what came before it");
         out.credit(1, 5);
+        assert!(!out.painting(1));
         out.data(1, b"after");
         drain(&mut out);
+        assert!(!out.painting(1), "nor is text a paint");
     }
 
     #[test]
@@ -418,9 +521,51 @@ mod tests {
         let mut out = Outbox::default();
         out.open_paused(1);
         out.resume(1);
+        out.queued_images(1);
+        assert!(out.images_queued(1));
         out.paint(1, b"a paint");
-        out.paint(1, b"images");
+        assert!(!out.images_queued(1));
+        out.paint_with_images(1, b"images");
+        assert!(out.images_queued(1), "those can be lost too, until they've gone");
         drain(&mut out);
+        assert!(!out.images_queued(1));
+    }
+
+    #[test]
+    fn a_paint_with_images_holds_back_the_next_for_several_times_as_long_as_it_took() {
+        let mut out = flowing();
+        let now = Instant::now();
+        assert_eq!(out.images_wait(1, now), Duration::ZERO);
+        out.paint_with_images(1, &[b'p'; 100]);
+        assert_eq!(out.images_wait(1, now), Duration::ZERO, "not until it's out");
+        let took = Duration::from_millis(30);
+        std::thread::sleep(took);
+        drain(&mut out);
+        assert!(out.images_wait(1, Instant::now()) >= took * 3, "most of four times as long, a moment later");
+        out.streams.get_mut(&1).unwrap().image_paint_at = Some(Instant::now() - Duration::from_secs(3600));
+        out.streams.get_mut(&1).unwrap().paint_left = 1;
+        out.streams.get_mut(&1).unwrap().pending.push_back(b'p');
+        drain(&mut out);
+        assert!(
+            out.images_wait(1, Instant::now()) <= IMAGE_PAINT_WAIT_MOST,
+            "a viewer that stalled isn't punished forever"
+        );
+
+        let mut text = flowing();
+        text.paint(1, &[b'p'; 100]);
+        std::thread::sleep(Duration::from_millis(5));
+        drain(&mut text);
+        assert_eq!(text.images_wait(1, Instant::now()), Duration::ZERO, "only paints with images count");
+
+        let mut replaced = flowing();
+        replaced.paint_with_images(1, &[b'p'; 100]);
+        replaced.paint(1, &[b't'; 100]);
+        drain(&mut replaced);
+        assert_eq!(
+            replaced.images_wait(1, Instant::now()),
+            Duration::ZERO,
+            "one replaced before going out costs nothing"
+        );
     }
 
     #[test]

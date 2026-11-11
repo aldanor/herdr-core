@@ -1,12 +1,17 @@
 //! What tests of this crate and of those using it all need.
 
-use crate::Terminal;
 pub use crate::kitty::{ImagePlacement, base64};
+use crate::{Clearing, Terminal};
 
 impl Terminal {
     /// The active screen's placements, as the screen holds them.
     pub fn image_placements(&self) -> Vec<ImagePlacement> {
         self.placements()
+    }
+
+    /// A paint with every image encoded on the spot, however large.
+    pub fn paint(&self, history: usize) -> Vec<u8> {
+        self.paint_with(history, self.images_vt(usize::MAX), Clearing::Images)
     }
 
     /// An image's pixels, for comparing screens.
@@ -16,8 +21,8 @@ impl Terminal {
     }
 
     #[cfg(test)]
-    pub(crate) fn images_within(&self, budget: usize) -> crate::kitty::Replay {
-        self.images_walk(budget, true)
+    pub(crate) fn images_within(&self, budget: usize, inline_pixels: usize) -> crate::kitty::Replay {
+        self.images_walk(budget, inline_pixels, true)
     }
 }
 
@@ -100,4 +105,9 @@ pub fn png_filled(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header().unwrap().write_image_data(&pixels).unwrap();
     out
+}
+
+/// A direct image of one pixel, whose `control` says where it goes.
+pub fn dot(control: &str, rgba: [u8; 4]) -> Vec<u8> {
+    chunked(&format!("a=T,f=32,s=1,v=1,{control},q=2"), &rgba)
 }

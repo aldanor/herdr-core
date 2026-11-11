@@ -66,7 +66,8 @@ pub fn serve() -> io::Result<()> {
     let core = Core::start(paths, info)?;
     let bound = AsyncListener::bind(&socket)?;
 
-    tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let served = runtime.block_on(async {
         let mut listener = AsyncListener::serve(bound)?;
         platform::start_logout_linger();
         crate::restart::discard(&core.paths);
@@ -82,6 +83,9 @@ pub fn serve() -> io::Result<()> {
             tokio::spawn(core.clone().run_jobs(jobs));
         }
         crate::remote::start_all(&core);
+        if let Some(asked) = core.encoder_rx.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            tokio::spawn(core.clone().run_encoder(asked));
+        }
         tokio::spawn(core.clone().watch_foreground());
         tokio::spawn(core.clone().save_when_due());
         tokio::spawn(core.clone().expire_image_answers());
@@ -103,7 +107,10 @@ pub fn serve() -> io::Result<()> {
         }
         platform::remove_endpoint(&socket);
         finish(&core).await
-    })
+    });
+    // An encode still running mustn't keep the lock from the next core.
+    runtime.shutdown_background();
+    served
 }
 
 /// Finish queued registry work before the runtime cancels its tasks (which still own Core).
@@ -537,6 +544,8 @@ async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use ghostty_vt::testing::count;
 
     #[cfg(unix)]
     fn test_core() -> (Arc<Core>, std::path::PathBuf) {
@@ -597,9 +606,10 @@ mod tests {
 
     #[cfg(unix)]
     impl Quiet {
-        fn start() -> Quiet {
+        fn start(inline_pixels: usize) -> Quiet {
             let (core, root) = test_core();
             let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
+            screen.set_inline_pixels(inline_pixels);
             for image in 11..=14 {
                 screen.write(format!("\x1b_Ga=T,f=32,s=1,v=1,i={image},c=2,r=1,C=1,q=2;AAAAAA==\x1b\\").as_bytes());
             }
@@ -615,6 +625,8 @@ mod tests {
         /// What its writer sends, until `enough` of it or a second of silence.
         async fn sends(&self, enough: impl Fn(&[u8]) -> bool) -> Vec<u8> {
             let (writer, mut reader) = writing(&self.core, &self.conn);
+            let asked = self.core.encoder_rx.lock().unwrap().take().unwrap();
+            let encoder = tokio::spawn(self.core.clone().run_encoder(asked));
             self.conn.wake.notify_one();
             let mut got = Vec::new();
             let silence = std::time::Duration::from_secs(1);
@@ -625,6 +637,7 @@ mod tests {
                 got.extend(bytes);
             }
             writer.abort();
+            encoder.abort();
             got
         }
     }
@@ -638,13 +651,47 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_writer_finishes_encoding_with_no_credit_coming_back_to_wake_it() {
+        let quiet = Quiet::start(0);
+        let sent = |got: &[u8]| count(got, b"a=t,");
+        let got = quiet.sends(|got| sent(got) >= 4).await;
+        assert_eq!(sent(&got), 4, "none in the first paint, then all four in the next");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_repaint_waiting_for_a_paint_follows_it_with_no_credit_coming_back() {
         // All encoded on the spot: the encoder finishing would wake the writer too.
-        let quiet = Quiet::start();
+        let quiet = Quiet::start(usize::MAX);
         quiet.core.lock().screens.get_mut(&quiet.id).unwrap().write(b"\x1b[Hafterwards");
         quiet.core.repaint_after_read(&mut quiet.core.lock(), quiet.id);
         let has_it = |got: &[u8]| got.windows(10).any(|w| w == b"afterwards");
         assert!(has_it(&quiet.sends(has_it).await));
+    }
+
+    /// An image that takes a while to encode, whatever the machine.
+    #[cfg(unix)]
+    fn noisy_image(id: u32) -> Vec<u8> {
+        let control = format!("a=T,f=32,s=512,v=512,i={id},c=2,r=1,C=1,q=2");
+        ghostty_vt::testing::chunked(&control, &ghostty_vt::testing::noise_from(id as u64, 1 << 20))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_runtime_is_free_while_the_encoder_compresses() {
+        let quiet = Quiet::start(0);
+        quiet.core.lock().screens.get_mut(&quiet.id).unwrap().write(&noisy_image(9));
+        let asked = quiet.core.encoder_rx.lock().unwrap().take().unwrap();
+        let encoder = tokio::spawn(quiet.core.clone().run_encoder(asked));
+        let _ = crate::viewers::first_paint(&quiet.core.lock(), quiet.id, 0);
+        let mut turns = 0;
+        while quiet.core.lock().screens[&quiet.id].encoding() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            turns += 1;
+            assert!(turns < 60_000);
+        }
+        encoder.abort();
+        assert!(turns >= 5, "only {turns}: it held everything else up");
     }
 
     #[cfg(unix)]
@@ -671,6 +718,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let next = next.expect("the writer left the repaint behind the old paint").unwrap().unwrap();
         assert_eq!((next.0, next.1, next.2.first()), (channel, wire::DATA, Some(&0x18)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_busy_channel_does_not_keep_images_from_another_on_its_connection() {
+        let quiet = Quiet::start(0);
+        let hot = 100;
+        quiet.conn.with(|out| {
+            out.open(hot);
+            assert!(out.data(hot, &vec![0; 1 << 20]));
+        });
+        let (writer, mut read) = writing(&quiet.core, &quiet.conn);
+        quiet.conn.wake.notify_one();
+        let (channel, _, first) = wire::read_frame(&mut read).await.unwrap().unwrap();
+        assert!(channel == 1 && count(&first, b"a=t,") == 0, "or this isn't the case it's about");
+        // Ready now, with the writer sending and nothing to come back to.
+        while let Some(job) = quiet.core.next_encode(quiet.id) {
+            quiet.core.keep_encoded(quiet.id, job.run());
+        }
+        quiet.core.encoding_finished(quiet.id);
+        quiet.conn.with(|out| out.hold_images_until(1, None));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut images = 0;
+        while images == 0 {
+            assert!(std::time::Instant::now() < deadline, "and they're still not here");
+            let (channel, _, bytes) = wire::read_frame(&mut read).await.unwrap().unwrap();
+            if channel == hot {
+                quiet.conn.with(|out| {
+                    assert!(out.data(hot, &vec![0; bytes.len()]));
+                    out.credit(hot, bytes.len());
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            } else {
+                images += count(&bytes, b"a=t,");
+            }
+        }
+        writer.abort();
+    }
+
+    /// A terminal with one small image, watched, beside `quiet`'s with four slow ones.
+    #[cfg(unix)]
+    fn small_beside(quiet: &Quiet) -> u32 {
+        let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
+        screen.set_inline_pixels(0);
+        screen.write(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=2,r=1,C=1,q=2;AAAAAA==\x1b\\");
+        let small = shell_with(&quiet.core, screen);
+        attach(&quiet.core, &Arc::new(Conn::default()), small);
+        let mut st = quiet.core.lock();
+        for id in 21..=24 {
+            st.screens.get_mut(&quiet.id).unwrap().write(&noisy_image(id));
+        }
+        small
+    }
+
+    /// Whether the large terminal is still encoding when the small one has finished.
+    #[cfg(unix)]
+    async fn large_outlasts_small(quiet: &Quiet, small: u32, asked: tokio::sync::mpsc::UnboundedReceiver<u32>) -> bool {
+        let encoder = tokio::spawn(quiet.core.clone().run_encoder(asked));
+        {
+            let st = quiet.core.lock();
+            let _ = crate::viewers::first_paint(&st, quiet.id, 0);
+            let _ = crate::viewers::first_paint(&st, small, 0);
+        }
+        let mut turns = 0;
+        while quiet.core.lock().screens[&small].encoding() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            turns += 1;
+            assert!(turns < 60_000);
+        }
+        let large_still_going = quiet.core.lock().screens[&quiet.id].encoding();
+        encoder.abort();
+        large_still_going
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_asked_for_first_with_little_to_encode_does_not_wait_for_another() {
+        let quiet = Quiet::start(0);
+        let small = small_beside(&quiet);
+        let mut asked = quiet.core.encoder_rx.lock().unwrap().take().unwrap();
+        while asked.try_recv().is_ok() {}
+        {
+            let st = quiet.core.lock();
+            let sender = st.encoder.as_ref().unwrap();
+            sender.send(small).unwrap();
+            sender.send(quiet.id).unwrap();
+        }
+        assert!(large_outlasts_small(&quiet, small, asked).await, "the small one had to wait for all of it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_with_a_lot_to_encode_does_not_hold_up_another() {
+        let quiet = Quiet::start(0);
+        let small = small_beside(&quiet);
+        let asked = quiet.core.encoder_rx.lock().unwrap().take().unwrap();
+        assert!(large_outlasts_small(&quiet, small, asked).await, "the small one had to wait for all of it");
     }
 
     #[test]

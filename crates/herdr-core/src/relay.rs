@@ -19,13 +19,25 @@ pub fn image_answer_wait() -> Duration {
 }
 
 const ESC: u8 = 0x1b;
+const CAN: u8 = 0x18;
+const SUB: u8 = 0x1a;
 const BEL: u8 = 0x07;
 /// Queries are short; anything longer is passed through unexamined.
 const MAX_CSI: usize = 64;
 const MAX_STRING: usize = 512;
 
+#[derive(Debug, Default, PartialEq)]
+pub struct Named {
+    /// Images commands placed, by generation.
+    pub images: Vec<u64>,
+    /// What the screen held at the last change of screen, by generation.
+    pub switched: Option<u64>,
+}
+
 #[derive(Default)]
 pub struct Relay {
+    /// What's gone to viewers so far ends mid-sequence, for whatever comes next to end.
+    viewer_unfinished: bool,
     /// An escape sequence still arriving, kept back until it can be judged.
     held: Vec<u8>,
     /// Inside an APC: how many reply bytes were waiting when it began.
@@ -46,6 +58,137 @@ pub struct Relay {
     query: u64,
     queries: Vec<(graphics::Key, u64)>,
     unanswered: Vec<u64>,
+    pub loads: Loads,
+}
+
+/// Longest command head kept: real ones are far shorter, however many keys they use.
+const HEAD_MAX: usize = 1024;
+
+/// Follows kitty commands just far enough to tell whether a chunked image is still
+/// arriving: a paint can't carry that one, and the screen's API can't tell. It looks
+/// only at what follows `ESC _`, so a terminal without images pays nothing. A crafted
+/// command it reads differently from Ghostty can cost a viewer a late or a needless paint.
+#[derive(Default)]
+pub struct Loads {
+    /// A chunk has said more follow, and the last hasn't reached the screen. Each
+    /// screen has its own: main, alternate.
+    open: [bool; 2],
+    /// How many have ended, which is what's new since a viewer's last paint.
+    finished: u64,
+    /// Each start and end of a command: what a viewer can't miss and still have what
+    /// the screen has, though nothing has changed there yet.
+    seen: u64,
+    /// The images commands have placed since last asked, by generation: for one a viewer
+    /// never got, these commands do nothing there.
+    named: Vec<u64>,
+    /// What the screen held at the last change of screen, by generation.
+    switched: Option<u64>,
+    scan: Scan,
+    head: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LoadsNow {
+    pub open: bool,
+    pub finished: u64,
+}
+
+#[derive(Default, PartialEq)]
+enum Scan {
+    #[default]
+    Outside,
+    /// Just after `ESC _`: the next byte says which protocol.
+    Kind,
+    Head,
+    Body,
+}
+
+impl Loads {
+    pub fn now(&self) -> LoadsNow {
+        LoadsNow { open: self.open[0] || self.open[1], finished: self.finished }
+    }
+
+    pub fn seen(&self) -> u64 {
+        self.seen
+    }
+
+    pub fn take_named(&mut self) -> Named {
+        Named { images: std::mem::take(&mut self.named), switched: self.switched.take() }
+    }
+
+    fn set_open(&mut self, alt: bool, open: bool) {
+        self.finished += (self.open[alt as usize] && !open) as u64;
+        self.open[alt as usize] = open;
+    }
+
+    pub fn in_command(&self) -> bool {
+        matches!(self.scan, Scan::Head | Scan::Body)
+    }
+
+    /// Reads what's there of a head, up to the ESC that `feed` will see for itself.
+    fn read_head(&mut self, bytes: &[u8]) {
+        let mut bytes = bytes.iter();
+        while matches!(self.scan, Scan::Kind | Scan::Head) {
+            let Some(&b) = bytes.next().filter(|b| !matches!(**b, ESC | CAN | SUB)) else { return };
+            self.scan = match self.scan {
+                Scan::Kind if b == b'G' => {
+                    self.seen += 1;
+                    Scan::Head
+                }
+                Scan::Head if b == b';' => Scan::Body,
+                Scan::Head => {
+                    if self.head.len() < HEAD_MAX {
+                        self.head.push(b);
+                    }
+                    Scan::Head
+                }
+                _ => Scan::Outside,
+            };
+        }
+    }
+
+    /// The keys that say what a command does to a load, as real programs write them.
+    fn keys(&self) -> Keys {
+        let mut keys = Keys { action: b't', direct: true, more: false, id: 0 };
+        for kv in self.head.split(|b| *b == b',') {
+            let Some(at) = kv.iter().position(|b| *b == b'=') else { continue };
+            let (key, value) = (&kv[..at], &kv[at + 1..]);
+            let number = || std::str::from_utf8(value).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+            match (key, value) {
+                (b"a", [action]) => keys.action = *action,
+                (b"t", [medium]) => keys.direct = *medium == b'd',
+                (b"m", _) => keys.more = number() > 0,
+                (b"i", _) => keys.id = number(),
+                _ => {}
+            }
+        }
+        keys
+    }
+
+    /// As Ghostty's loader, just before the screen sees what ends the command: only one
+    /// sent directly can have more chunks, and a delete abandons what was arriving.
+    /// Placing and querying leave it alone.
+    fn command(&mut self, screen: &Screen) {
+        self.seen += 1;
+        let alt = screen.alt_screen();
+        let keys = self.keys();
+        match keys.action {
+            b't' | b'T' | b'f' => self.set_open(alt, keys.more && keys.direct),
+            b'd' => self.set_open(alt, false),
+            _ => {}
+        }
+        if keys.action == b'p' {
+            self.named.extend(screen.images_named(&[keys.id]));
+        }
+        self.head.clear();
+    }
+}
+
+struct Keys {
+    action: u8,
+    direct: bool,
+    more: bool,
+    id: u32,
 }
 
 enum Seq {
@@ -126,23 +269,97 @@ impl Relay {
     pub fn feed(&mut self, screen: &mut Screen, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len());
         let mut run = 0;
-        for (i, &b) in input.iter().enumerate() {
+        if self.held.is_empty() {
+            self.loads.read_head(input);
+        }
+        let mut next = 0;
+        while next < input.len() {
+            let (i, b) = (next, input[next]);
+            next += 1;
             let image = self.graphics.push(b);
             if self.held.is_empty() {
                 if b == ESC {
                     pass(screen, &mut out, &input[run..i]);
                     self.held.push(b);
+                    continue;
                 }
+                // Ghostty runs a command at these too.
+                if self.loads.in_command() && matches!(b, CAN | SUB) {
+                    self.loads.command(screen);
+                    self.loads.scan = Scan::Outside;
+                }
+                // Nothing else matters until the next of those.
+                let mut rest = input[next..].iter();
+                let found = if self.loads.in_command() {
+                    rest.position(|b| matches!(*b, ESC | CAN | SUB))
+                } else {
+                    rest.position(|b| *b == ESC)
+                };
+                // The image parser still has to see all of it.
+                let skip = found.map_or(input.len(), |n| next + n);
+                input[next..skip].iter().for_each(|b| _ = self.graphics.push(*b));
+                next = skip;
                 continue;
+            }
+            // Ghostty starts over at an ESC inside a sequence, unless it can be the end of a string.
+            // A DCS stays whole: what's in tmux's passthrough has its ESCs doubled, and it's for
+            // whoever's watching to make sense of.
+            let after_esc = self.held.last() == Some(&ESC);
+            let cut = match self.held.get(1) {
+                Some(b'P') => None,
+                Some(b']') => (after_esc && self.held.len() > 2 && b != b'\\').then(|| self.held.len() - 1),
+                _ => (b == ESC).then_some(self.held.len()),
+            };
+            if let Some(cut) = cut {
+                let rest = self.held.split_off(cut);
+                if self.loads.in_command() {
+                    self.loads.command(screen);
+                }
+                self.end_apc(screen);
+                let seq = std::mem::replace(&mut self.held, rest);
+                // A viewer gets all of it, as it came. A query in a string it ends here is
+                // answered here, though, for which the screen has to see it end. A lone ESC
+                // says nothing to the screen that the next one doesn't.
+                let answered = seq.len() > 1 && {
+                    let before = screen.pending_responses();
+                    screen.write(&seq);
+                    if seq.get(1) == Some(&b']') {
+                        screen.write(b"\x1b\\");
+                    }
+                    screen.pending_responses() != before
+                };
+                if !answered {
+                    out.extend_from_slice(&seq);
+                    self.viewer_unfinished = true;
+                }
+                self.loads.scan = Scan::Outside;
+                // The ESC just seen starts one of its own, whatever was before it.
+                if b == ESC {
+                    pass(screen, &mut out, &std::mem::take(&mut self.held));
+                    self.viewer_unfinished = true;
+                    self.held.push(ESC);
+                    run = i + 1;
+                    continue;
+                }
             }
             self.held.push(b);
             if let Seq::Done { maybe_query } = self.judge() {
                 let seq = std::mem::take(&mut self.held);
+                // The ESC of this ends any command before it, on the screen it arrived on.
+                if self.loads.in_command() {
+                    self.loads.command(screen);
+                }
+                if seq != b"\x1b\\" {
+                    self.end_apc(screen);
+                }
                 if maybe_query {
                     let before = screen.pending_responses();
                     screen.write(&seq);
                     if screen.pending_responses() == before {
                         out.extend_from_slice(&seq); // not answered here: the viewer may
+                    } else if self.viewer_unfinished {
+                        // Taking this out would leave the viewer in what this one ended.
+                        out.extend_from_slice(b"\x1b\\");
                     }
                 } else {
                     if let Some(on) = win32_input(&seq) {
@@ -151,7 +368,11 @@ impl Relay {
                     if seq == b"\x1b_" {
                         self.apc = Some(screen.pending_responses());
                     }
+                    let alt = seq.starts_with(b"\x1b[?").then(|| screen.alt_screen());
                     pass(screen, &mut out, &seq);
+                    if alt.is_some_and(|alt| alt != screen.alt_screen()) {
+                        self.loads.switched = Some(screen.images_generation());
+                    }
                     // An APC ends with ST; whatever the screen answered to it goes,
                     // and an answer means a viewer that shows images answers too.
                     if seq == b"\x1b\\"
@@ -174,6 +395,17 @@ impl Relay {
                         screen.drop_responses_after(keep);
                     }
                 }
+                self.viewer_unfinished = false;
+                self.loads.scan = Scan::Outside;
+                // A full reset drops what either screen was loading.
+                if seq == b"\x1bc" {
+                    self.loads.set_open(false, false);
+                    self.loads.set_open(true, false);
+                }
+                if seq == b"\x1b_" {
+                    self.loads.scan = Scan::Kind;
+                    self.loads.read_head(&input[i + 1..]);
+                }
                 run = i + 1;
             }
         }
@@ -181,6 +413,16 @@ impl Relay {
             pass(screen, &mut out, &input[run..]);
         }
         out
+    }
+
+    /// An APC cut short by another sequence: what the screen answered to it goes, and a
+    /// viewer's is left to end the same way.
+    fn end_apc(&mut self, screen: &mut Screen) {
+        if let Some(keep) = self.apc.take() {
+            screen.write(b"\x1b\\");
+            screen.drop_responses_after(keep);
+            self.viewer_unfinished = true;
+        }
     }
 
     /// A viewer missed a sequence too large to replay. Consume just its tail,
@@ -194,6 +436,10 @@ impl Relay {
         if let Some(keep) = self.apc.take() {
             screen.drop_responses_after(keep);
         }
+        if self.loads.in_command() {
+            self.loads.command(screen);
+        }
+        self.loads.scan = Scan::Outside;
         // Output is still flowing: images wait for it to rest, like any other repaint's.
         #[cfg(test)]
         crate::viewers::tests::PAINTS.with(|n| n.set(n.get() + 1));
@@ -284,6 +530,145 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_escape_interrupted_by_another_does_not_hide_what_follows() {
+        for prefix in [
+            &b"\x1b"[..],
+            b"\x1b[",
+            b"\x1b[12;",
+            b"\x1b]2;abandoned",
+            b"\x1b]2;abandoned\x1b",
+            b"\x1b]2;abandoned\x1b\x1b",
+        ] {
+            let mut stream = prefix.to_vec();
+            stream.extend(b"\x1b_Ga=T,f=32,s=2,v=1,i=2,q=2,m=1;AQID\x1b\\tail");
+            let (relay, screen) = fed(&stream);
+            assert!(relay.loads.now().open, "{prefix:?}");
+            assert!(relay.held.is_empty(), "{prefix:?}");
+            assert!(screen.plain_text().contains("tail"), "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn an_escape_interrupting_a_command_ends_it() {
+        let (relay, _screen) = fed(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,m=1,q=2;AAAA\x1b_Gm=0;AA==");
+        assert!(relay.loads.in_command(), "the next one has begun");
+        let (mut relay, mut screen) = fed(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,m=1,q=2;AAAA\x1b\x1b");
+        assert!(!relay.loads.in_command());
+        assert!(relay.loads.now().open, "that one said more was to come");
+        relay.feed(&mut screen, b"[m");
+        assert!(!relay.loads.in_command());
+        assert!(relay.loads.now().open, "and it isn't ended twice");
+    }
+
+    #[test]
+    fn what_a_command_places_is_named_once() {
+        const SENT: &[u8] = b"\x1b_Ga=t,f=32,s=1,v=1,i=3,q=2;AAAAAA==\x1b\\";
+        let (mut relay, mut screen) = fed(SENT);
+        let before = screen.images_named(&[3]);
+        assert_eq!(before.len(), 1);
+        assert_eq!(taken(&mut relay), (vec![], None), "it has this from the stream");
+        relay.feed(&mut screen, b"\x1b_Ga=p,i=3,q=2\x1b\\\x1b_Ga=p,i=9,p=1,q=2\x1b\\");
+        assert_eq!(taken(&mut relay), (before, None), "and none for what isn't there");
+        assert_eq!(taken(&mut relay), (vec![], None), "just the once");
+        let (mut relay, _screen) = fed(b"\x1b_Ga=q,f=32,s=1,v=1,i=3,q=2;AAAAAA==\x1b\\");
+        assert_eq!(taken(&mut relay), (vec![], None));
+    }
+
+    #[test]
+    fn a_change_of_screen_says_what_the_new_one_held_then() {
+        let (mut relay, mut screen) = fed(b"\x1b[?47h\x1b_Ga=T,f=32,s=1,v=1,i=3,c=2,r=1,q=2;AAAAAA==\x1b\\");
+        let switched = relay.loads.take_named().switched;
+        assert!(switched.is_some_and(|at| at < screen.images_generation()), "that one came after");
+        relay.feed(&mut screen, b"\x1b[?47l\x1b[?47h");
+        let switched = relay.loads.take_named().switched;
+        assert_eq!(switched, Some(screen.images_generation()), "and this time it was there before");
+        relay.feed(&mut screen, b"\x1b[?25l\x1b[?1000h");
+        assert_eq!(relay.loads.take_named().switched, None);
+    }
+
+    #[test]
+    fn a_command_is_read_by_the_keys_real_programs_write() {
+        let opens = |head: &str| {
+            let (relay, _screen) = fed(format!("\x1b_G{head};AAAA\x1b\\").as_bytes());
+            relay.loads.now().open
+        };
+        for head in ["m=1", "a=t,m=1", "a=T,m=1,q=2", "a=t,xy=1,m=1", "a=t,b,m=1", "a=t,m=1,o=z", "a=t,m=1,f=7"] {
+            assert!(opens(head), "{head}");
+        }
+        for head in ["a=t", "a=t,m=0", "a=t,mm=1", "a=t,m=1,t=f", "a=q,m=1", "a=p,m=1"] {
+            assert!(!opens(head), "{head}");
+        }
+        let (mut relay, _screen) = fed(b"\x1b_Ga=t,f=32,s=1,v=1,i=3,q=2;AAAAAA==\x1b\\\x1b_Ga=p,i=3,t=x,o=x,q=2\x1b\\");
+        assert_eq!(relay.loads.take_named().images.len(), 1, "those keys mean nothing to a placement");
+    }
+
+    #[test]
+    fn can_and_sub_end_a_command_as_an_escape_does() {
+        for end in [0x18u8, 0x1a] {
+            let mut stream = b"\x1b_Ga=t,f=32,s=1,v=1,i=1,m=1,q=2;AAAA\x1b\\\x1b_Gm=0;AA==".to_vec();
+            stream.push(end);
+            stream.extend(b"tail");
+            let (relay, screen) = fed(&stream);
+            assert_eq!(relay.loads.now().finished, 1, "{end}");
+            assert!(!relay.loads.in_command());
+            assert!(screen.plain_text().contains("tail"));
+            assert!(screen.image_pixels(1).is_some());
+        }
+        let (relay, _screen) = fed(b"\x1b_Ga=t,m=1\x18x;y");
+        assert!(relay.loads.now().open, "the head stops there too");
+        let (relay, _screen) = fed(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,m=1,q=2;AAAA\x1b\\\x18plain\x18text");
+        assert!(relay.loads.now().open, "out of a command they say nothing");
+    }
+
+    #[test]
+    fn what_a_viewer_is_passed_comes_to_the_same_as_the_screen_however_a_sequence_is_cut_short() {
+        for stream in [
+            &b"\x1b]2;title\x1b[6ntext"[..],
+            b"\x1b\x1b[6ntext",
+            b"\x1b[6\x1b[6ntext",
+            b"\x1b]2;title\x1b7text",
+            b"\x1b]10;?\x1b[6ntext",
+            b"\x1b]10;?\x1b\x1b[6ntext",
+            b"\x1b]2;title\x1b\x1b[6ntext",
+            b"\x1b_Ga=q,i=1,s=1,v=1,f=32;AAAAAA==\x1b[6ntext",
+            b"\x1b_Ga=q,i=1,s=1,v=1,f=32;AAAAAA==\x1b\x1b[6ntext",
+            b"\x1b_x\x1b_y\x1b\\text",
+        ] {
+            let (mut relay, mut screen) = fed(b"");
+            let mut viewer = Screen::new(80, 24, 1 << 20);
+            for piece in [stream, b"\r\nend"] {
+                viewer.write(&relay.feed(&mut screen, piece));
+            }
+            assert_eq!(viewer.plain_text(), screen.plain_text(), "{stream:?}");
+            assert_eq!(viewer.title(), screen.title(), "{stream:?}");
+            assert!(screen.plain_text().contains("text"), "{stream:?}");
+        }
+    }
+
+    #[test]
+    fn a_query_with_nothing_left_unfinished_goes_without_a_trace() {
+        let (mut relay, mut screen) = fed(b"");
+        assert_eq!(relay.feed(&mut screen, b"\x1b]2;title\x1b7\x1b[6nmore"), b"\x1b]2;title\x1b7more");
+        assert_eq!(Relay::take_responses(&mut screen).len(), 6);
+    }
+
+    #[test]
+    fn a_query_after_an_apc_cut_short_is_still_answered() {
+        let (mut relay, mut screen) = fed(b"\x1b_Ga=q,i=1,s=1,v=1,f=32;AAAAAA==\x1b[6n\x1b\\");
+        assert!(relay.apc.is_none());
+        let replies = Relay::take_responses(&mut screen);
+        assert!(replies.ends_with(b"R"), "the cursor's position: {replies:?}");
+        assert!(!replies.windows(3).any(|w| w == b"\x1b_G"), "not the image's: {replies:?}");
+        relay.feed(&mut screen, b"plain");
+        assert!(screen.plain_text().contains("plain"));
+    }
+
+    fn taken(relay: &mut Relay) -> (Vec<u64>, Option<u64>) {
+        let named = relay.loads.take_named();
+        (named.images, named.switched)
+    }
+
+    #[test]
     fn tmux_passthrough_goes_through_as_it_came() {
         let short = b"\x1bPtmux;\x1b\x1b_Ga=T,f=32,s=1,v=1,i=1,q=2;AAAAAA==\x1b\x1b\\\x1b\\after".to_vec();
         for stream in [short.clone(), [&b"\x1bPtmux;"[..], &short[7..24], &vec![b'A'; 5000], &short[24..]].concat()] {
@@ -321,10 +706,167 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_answer_to_a_query_after_an_apc_is_kept_however_the_query_is_cut_short() {
+        let (mut relay, mut screen) = fed(b"\x1b_x\x1b]10;?\x1bXtext\x1b\\");
+        assert!(relay.apc.is_none());
+        let replies = Relay::take_responses(&mut screen);
+        assert!(replies.windows(4).any(|w| w == b"]10;"), "{replies:?}");
+        relay.feed(&mut screen, b"plain");
+    }
+
+    #[test]
+    fn a_query_cut_short_is_answered_once() {
+        let (mut relay, mut screen) = fed(b"");
+        let out = relay.feed(&mut screen, b"\x1b]10;?\x1bX");
+        assert!(screen.pending_responses() > 0, "or this isn't the case it's about");
+        assert!(!out.windows(2).any(|w| w == b"]1"), "{out:?}");
+    }
+
+    #[test]
+    fn an_escape_in_a_string_can_still_end_it_across_reads() {
+        let (mut relay, mut screen) = fed(b"\x1b]2;title\x1b");
+        relay.feed(&mut screen, b"\\after");
+        assert!(relay.held.is_empty());
+        assert_eq!(screen.title(), "title");
+        assert!(screen.plain_text().contains("after"));
+    }
+
     fn fed(input: &[u8]) -> (Relay, Screen) {
         let (mut relay, mut screen) = (Relay::default(), Screen::new(80, 24, 1 << 20));
         relay.feed(&mut screen, input);
         (relay, screen)
+    }
+
+    fn open_after(input: &[u8]) -> bool {
+        fed(input).0.loads.now().open
+    }
+
+    #[test]
+    fn a_load_is_open_from_its_first_chunk_until_its_last_however_the_bytes_arrive() {
+        let chunks: &[u8] = b"\x1b_Ga=T,f=32,i=1,m=1;AAAA\x1b\\\x1b_Gm=1;BBBB\x1b\\";
+        for step in [1, 7, chunks.len()] {
+            let (mut relay, mut screen) = fed(b"");
+            for part in chunks.chunks(step) {
+                relay.feed(&mut screen, part);
+            }
+            assert!(relay.loads.now().open);
+            relay.feed(&mut screen, b"\x1b_Gm=0;");
+            assert!(relay.loads.now().open, "the last chunk hasn't ended");
+            relay.feed(&mut screen, b"\x1b");
+            assert!(relay.loads.now().open, "the relay still holds this ESC, so the screen hasn't run the chunk");
+            relay.feed(&mut screen, b"\\");
+            assert!(!relay.loads.now().open);
+        }
+    }
+
+    #[test]
+    fn what_the_screen_takes_for_a_load_is_what_this_takes_for_one() {
+        // Whether the next image is taken for a continuation shows what the screen thinks.
+        let next = b"\x1b_Ga=T,f=32,s=1,v=1,i=9,q=2;AAAAAA==\x1b\\";
+        let first = "\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2,m=1;AAAA\x1b\\";
+        for after_first in [false, true] {
+            for head in [
+                "m=1",
+                "m=2",
+                "m=01",
+                "m=0",
+                "m=00",
+                "m=1,m=0",
+                "m=0,m=1",
+                "a=t,m=1",
+                "a=T,t=d,q=2,m=1",
+                "q=2",
+                "",
+                "t=f,m=1",
+                "a=p,i=1",
+                "a=q,i=3,m=1",
+                "a=d,d=a",
+                "a=d,d=i,i=1",
+                "a=f,i=1,m=0",
+            ] {
+                let input = format!("{}\x1b_G{head};AAAA\x1b\\", if after_first { first } else { "" });
+                let (relay, mut screen) = fed(input.as_bytes());
+                screen.write(next);
+                let taken = screen.image_placements().iter().all(|p| p.image != 9);
+                assert_eq!(relay.loads.now().open, taken, "{head:?}, after a first chunk: {after_first}");
+            }
+        }
+    }
+
+    #[test]
+    fn other_sequences_around_a_command_do_not_hide_it_or_end_it() {
+        let open = b"\x1b_Gm=1;AA\x1b\\";
+        assert!(open_after(b"text \x1b[31m\x1b_Gm=1;AA\x1b\\"));
+        assert!(open_after(b"\x1b_\x1b_Gm=1;\x1b\\"), "an APC cut short by another");
+        assert!(open_after(b"\x1b_Gm=0;AA\x1b_Gm=1;BB\x1b\\"), "the ESC that ended one starts the next");
+        assert!(open_after(b"\x1b_Gm=1;AA\x1b[0m"), "any ESC ends a command");
+        assert!(!open_after(b"\x1b_Gm=1;AA\x1b\\\x1b_Gm=0;\x1b\x1b_Xnot ours\x1b\\"));
+        for other in [&b"\x1b]2;title\x1b\\"[..], b"\x1b_Xother\x1b\\", b"plain", b"\x1b[31m"] {
+            let mut input = open.to_vec();
+            input.extend_from_slice(other);
+            assert!(open_after(&input), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_load_on_the_alternate_screen_alone_counts() {
+        let (relay, _) = fed(b"\x1b[?1049h\x1b_Gm=1;AA\x1b\\");
+        assert!(relay.loads.now().open);
+    }
+
+    #[test]
+    fn what_has_finished_is_counted_once_and_a_reset_ends_both_screens() {
+        let first = |relay: &Relay| relay.loads.now().finished;
+        let (mut relay, mut screen) = fed(b"\x1b_Gm=1;AA\x1b\\");
+        assert_eq!(first(&relay), 0, "still arriving");
+        relay.feed(&mut screen, b"\x1b_Gm=0;AA\x1b\\");
+        assert_eq!(first(&relay), 1);
+        relay.feed(&mut screen, b"\x1b_Gm=0;AA\x1b\\");
+        assert_eq!(first(&relay), 1, "a whole image wasn't arriving");
+        relay.feed(&mut screen, b"\x1b_Gm=1;AA\x1b\\\x1b[?1049h\x1b_Gm=1;AA\x1b\\");
+        assert!(relay.loads.now().open);
+        relay.feed(&mut screen, b"\x1bc");
+        assert!(!relay.loads.now().open);
+        assert_eq!(first(&relay), 3);
+    }
+
+    #[test]
+    fn each_screen_has_its_own_load_as_it_does_in_ghostty() {
+        let (mut relay, mut screen) = fed(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,m=1;AAAA\x1b\\");
+        relay.feed(&mut screen, b"\x1b[?1049h");
+        relay.feed(&mut screen, b"\x1b_Ga=t,f=32,s=1,v=1,i=2,m=1;AAAA\x1b\\\x1b_Gm=0;AA==\x1b\\");
+        assert!(relay.loads.now().open, "that one ended, and the main screen's goes on");
+        relay.feed(&mut screen, b"\x1b[?1049l\x1b_Gm=0;AA==\x1b\\");
+        assert!(!relay.loads.now().open);
+    }
+
+    #[test]
+    fn a_head_split_anywhere_is_read_whole_and_text_is_not_looked_at() {
+        let chunk: &[u8] = b"plain \x1b_Gq=2,i=1,m=1;AAAA\x1b\\plain";
+        for at in 0..chunk.len() {
+            let (mut relay, mut screen) = fed(b"");
+            relay.feed(&mut screen, &chunk[..at]);
+            relay.feed(&mut screen, &chunk[at..]);
+            assert!(relay.loads.now().open, "split at {at}");
+        }
+        let (relay, _) = fed(b"m=1;\x1b[0mm=1;");
+        assert!(!relay.loads.now().open, "only after ESC _ G");
+    }
+
+    #[test]
+    fn a_long_head_is_read_to_its_end_within_reason() {
+        let padded = |keys: usize| format!("\x1b_G{}m=1;AA\x1b\\", "i=1,".repeat(keys));
+        assert!(open_after(padded(200).as_bytes()));
+        assert!(!open_after(padded(HEAD_MAX).as_bytes()), "past the limit, what follows isn't kept");
+    }
+
+    #[test]
+    fn a_chunk_finished_by_a_viewer_recovering_ends_the_load() {
+        let (mut relay, mut screen) = fed(b"\x1b_Ga=t,m=1;AAAA\x1b\\\x1b_Gm=0;AAAA");
+        assert!(relay.loads.now().open);
+        relay.feed_to_ground(&mut screen, b"AAAA\x1b\\");
+        assert!(!relay.loads.now().open);
     }
 
     fn feed_bytewise(relay: &mut Relay, screen: &mut Screen, input: &[u8]) -> Vec<u8> {

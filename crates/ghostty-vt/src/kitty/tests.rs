@@ -1,5 +1,5 @@
 use super::*;
-use std::cell::Cell;
+use crate::testing::dot;
 use std::time::Duration;
 
 /// Each test its own: they share a process, not a lock, and one mustn't spend another's time.
@@ -52,6 +52,13 @@ pub(crate) fn png_of(width: u32, height: u32) -> Vec<u8> {
     png_as(png::ColorType::Rgba, png::BitDepth::Eight, width, height, &vec![7u8; width as usize * 4])
 }
 
+fn png_crc(bytes: &[u8]) -> [u8; 4] {
+    let crc = bytes.iter().fold(!0u32, |crc, b| {
+        (0..8).fold(crc ^ *b as u32, |c, _| if c & 1 == 1 { 0xedb88320 ^ (c >> 1) } else { c >> 1 })
+    });
+    (!crc).to_be_bytes()
+}
+
 /// A valid header and no pixels: all it takes to claim them.
 fn claiming(width: u32, height: u32) -> Vec<u8> {
     let mut file = Vec::new();
@@ -60,6 +67,56 @@ fn claiming(width: u32, height: u32) -> Vec<u8> {
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header().unwrap().finish().unwrap();
     file
+}
+
+#[test]
+fn a_decoder_reads_no_text_a_file_carries() {
+    let mut file = png_of(1, 1);
+    // Right after the header: a decoder stops reading at the pixels.
+    let at = 33;
+    let body = b"note\0\0compressed or not, nobody reads it";
+    let mut chunk = (body.len() as u32).to_be_bytes().to_vec();
+    chunk.extend(b"zTXt");
+    chunk.extend(body);
+    let crc = png_crc(&chunk[4..]);
+    chunk.extend(crc);
+    file.splice(at..at, chunk);
+    let mut decoder = png_decoder(&file, Instant::now() + Duration::from_secs(60));
+    let info = decoder.read_header_info().unwrap();
+    assert_eq!((info.width, info.height), (1, 1));
+    let reader = decoder.read_info().unwrap();
+    assert!(reader.info().compressed_latin1_text.is_empty());
+}
+
+#[test]
+fn a_decoder_only_ever_sees_the_file_in_pieces() {
+    let file = vec![7u8; 1 << 20];
+    let until = Instant::now() + Duration::from_secs(3600);
+    let mut paced = Paced { file: std::io::Cursor::new(&file), until };
+    assert_eq!(paced.fill_buf().unwrap().len(), 64 << 10);
+    paced.until = Instant::now() - Duration::from_secs(1);
+    assert_eq!(paced.fill_buf().unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn metadata_a_decoder_would_decompress_off_the_clock_is_not_read() {
+    use std::io::Write;
+    let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    zlib.write_all(&[0u8; 1 << 16]).unwrap();
+    let mut body = b"profile\0\0".to_vec();
+    body.extend(zlib.finish().unwrap());
+    let mut chunk = (body.len() as u32).to_be_bytes().to_vec();
+    chunk.extend_from_slice(b"iCCP");
+    chunk.extend_from_slice(&body);
+    let crc = png_crc(&chunk[4..]);
+    chunk.extend_from_slice(&crc);
+    let mut file = png_of(4, 2);
+    file.splice(33..33, chunk);
+    let until = Instant::now() + Duration::from_secs(3600);
+    let plain = png::Decoder::new(Paced { file: std::io::Cursor::new(&file), until });
+    assert!(plain.read_info().unwrap().info().icc_profile.is_some(), "it's there to be read");
+    let reader = png_decoder(&file, until).read_info().unwrap();
+    assert!(reader.info().icc_profile.is_none());
 }
 
 #[test]
@@ -150,11 +207,82 @@ fn a_placeholder_placement_says_all_the_program_said_and_nothing_else() {
 }
 
 #[test]
+fn decoding_is_charged_by_the_clock_and_in_seconds() {
+    let second_ago = Instant::now() - Duration::from_secs(1);
+    let seconds = real_seconds(second_ago) * DECODE_BUILD;
+    assert!((1.0..2.0).contains(&seconds), "{seconds}");
+}
+
+#[test]
+fn an_encoder_that_panics_gives_the_image_up_rather_than_taking_it_again() {
+    let job = EncodeJob { id: 1, width: 1, height: 1, format: FORMAT_RGB, generation: 1, pixels: vec![0; 3] };
+    ENCODE_PANICS.set(true);
+    let done = job.run();
+    ENCODE_PANICS.set(false);
+    assert!(done.commands.is_none());
+}
+
+#[test]
+fn looking_at_what_a_paint_would_carry_copies_none_of_it() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&dot("i=1,c=2,r=1,C=1", [0; 4]));
+    a.encoded(a.next_encode().unwrap().run());
+    let walked = a.images_walk(PAINT_BYTES, 0, false);
+    assert!(!walked.carried.deferred);
+    assert!(walked.direct.is_empty());
+}
+
+#[test]
+fn what_a_paint_carried_does_not_depend_on_where_the_images_went() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&dot("i=1,U=1,c=1,r=1,C=1", [1, 2, 3, 4]));
+    a.write(&dot("i=2,c=1,r=1,C=1", [1, 2, 3, 4]));
+    a.write(b"\x1b_Ga=p,i=2,p=7,U=1,c=1,r=1,q=2\x1b\\");
+    let before = a.images_walk(PAINT_BYTES, usize::MAX, true).carried.images;
+    a.write(&b"\r\n".repeat(30));
+    assert_eq!(a.images_walk(PAINT_BYTES, usize::MAX, true).carried.images, before);
+}
+
+#[test]
 fn a_png_has_to_fit_to_its_very_last_byte() {
     let pixels = [1, 2, 3, 4];
     let image = Image { id: 1, width: 1, height: 1, format: 1, generation: 1, data: pixels.as_ptr(), len: 4 };
     let length = png_file(&image, &pixels, 1024).unwrap().len();
     assert!(png_file(&image, &pixels, length - 1).is_none());
+}
+
+#[test]
+fn where_images_are_changes_with_the_cells_they_take_up() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(b"\x1b_Ga=T,f=32,s=20,v=40,i=1,C=1,q=2;");
+    a.write(base64(&[1u8; 3200]).as_bytes());
+    a.write(b"\x1b\\");
+    let places = a.image_places();
+    let generation = a.images_generation();
+    a.set_display(None, None, None, Some((20, 40)));
+    assert_eq!(a.images_generation(), generation);
+    assert_ne!(a.image_places(), places);
+}
+
+#[test]
+fn placed_images_names_every_image_in_view() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    for id in [1, 2, 3] {
+        a.write(&dot(&format!("i={id},c=2,r=1,C=1"), [0; 4]));
+    }
+    assert_eq!(a.placed_images().len(), 3);
+    assert_eq!(a.images_named(&[1, 3, 9]).len(), 2);
+}
+
+#[test]
+fn where_images_are_changes_with_the_column_alone() {
+    let at = |col| {
+        let mut t = Terminal::new(80, 24, 1 << 20);
+        t.write(format!("\x1b[4;{col}H").as_bytes());
+        t.write(&dot("i=1,c=2,r=1,C=1", [1, 2, 3, 4]));
+        t.image_places()
+    };
+    assert_ne!(at(2), at(8));
 }
 
 #[test]
@@ -170,6 +298,42 @@ fn a_placeholder_placement_keeps_the_part_of_the_image_it_shows() {
 }
 
 #[test]
+fn being_ready_leaves_what_a_paint_would_give_up_to_date() {
+    let mut t = Terminal::new(80, 24, 1 << 20);
+    t.write(&dot("i=1,c=1,r=1,C=1", [1, 2, 3, 4]));
+    assert!(t.images_given().lacks(&t.placed_images()));
+    while let Some(job) = t.next_encode() {
+        t.encoded(job.run());
+    }
+    assert!(t.images_ready());
+    assert!(!t.images_given().lacks(&t.placed_images()));
+}
+
+#[test]
+fn the_same_places_are_the_same_whatever_order_the_images_came_in() {
+    let at = |ids: &[u32]| {
+        let mut t = Terminal::new(80, 24, 1 << 20);
+        for id in ids {
+            t.write(format!("\x1b[{id};1H").as_bytes());
+            t.write(&dot(&format!("i={id},c=2,r=1,C=1"), [1, 2, 3, 4]));
+        }
+        t.image_places()
+    };
+    assert_eq!(at(&[1, 5, 9]), at(&[9, 1, 5]));
+}
+
+#[test]
+fn a_deadline_passing_partway_through_a_file_stops_it_there() {
+    use std::io::Read;
+    let file = vec![0u8; 200 << 10];
+    let until = Instant::now() + Duration::from_secs(3600);
+    let mut paced = Paced { file: std::io::Cursor::new(&file), until };
+    assert!(paced.read(&mut [0; 1024]).is_ok());
+    paced.until = Instant::now() - Duration::from_secs(1);
+    assert_eq!(paced.read(&mut [0; 1024]).unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[test]
 fn a_file_claiming_more_than_a_screen_keeps_or_ghostty_shows_is_refused_before_it_costs_anything() {
     let budget = budget();
     let now = Instant::now();
@@ -179,6 +343,19 @@ fn a_file_claiming_more_than_a_screen_keeps_or_ghostty_shows_is_refused_before_i
     assert_eq!(left(&budget), DECODE_SAVED);
     assert!(decode(&claiming(4096, 4096), now, real_seconds, &budget).is_none());
     assert!(left(&budget) < DECODE_SAVED, "this one was worth trying, and is charged");
+}
+
+#[test]
+fn decoding_stops_when_its_time_is_up() {
+    let (file, budget) = (png_of(64, 64), budget());
+    let long_ago = Instant::now() - Duration::from_secs(3600);
+    assert!(decode(&file, long_ago, real_seconds, &budget).is_none());
+    assert!(decode(&file, Instant::now(), real_seconds, &budget).is_some());
+    assert!(left(&budget) < DECODE_SAVED, "and what works is charged");
+    if cfg!(debug_assertions) {
+        let since = Instant::now() - Duration::from_secs(1);
+        assert!(decode(&png_of(1, 1), since, |_| 0.0, &budget).is_some(), "a debug build gets the time it charges for");
+    }
 }
 
 #[test]
@@ -192,6 +369,15 @@ fn decoding_comes_out_of_a_budget_that_time_refills_up_to_what_can_be_saved() {
     budget.lock().unwrap().left = 0.0;
     budget.lock().unwrap().earn(start + Duration::from_secs(3601));
     assert!((left(&budget) - DECODE_SHARE).abs() < 1e-9, "a second earns a share of it");
+}
+
+#[test]
+fn one_large_image_may_overdraw_and_then_pays_it_back() {
+    let (file, budget, start) = (png_of(1, 1), budget(), Instant::now());
+    assert!(decode(&file, start, |_| DECODE_MOST, &budget).is_some());
+    let owed = (DECODE_MOST - DECODE_SAVED) / DECODE_SHARE;
+    assert!(decode(&file, start + Duration::from_secs_f64(owed * 0.9), |_| 0.0, &budget).is_none(), "still paying");
+    assert!(decode(&file, start + Duration::from_secs_f64(owed * 1.1), |_| 0.0, &budget).is_some());
 }
 
 #[test]

@@ -66,7 +66,8 @@ Channel 0 carries JSON-RPC both ways. Calls on it run side by side.
 and `CSI ?9001h` or `l`: whether the program asked for win32-input-mode,
 as Windows' ConPTY does when it starts), then the program's raw output,
 minus terminal queries the core already answered. The first paint carries up
-to 5 MiB of images, newest first; one that doesn't fit is left out. The core never encodes
+to 5 MiB of images, newest first; one that doesn't fit is left out, and those
+not yet encoded follow in a repaint once they are. The core never encodes
 keys: a viewer that honors 9001 sends key events in that format itself.
 The viewer sends keys as DATA on the same channel, and RESIZE,
 FOCUS and FACTS as it changes. The last active viewer sets the size
@@ -104,7 +105,8 @@ behavior: no additional resize paints or RESIZE frames.
 Flow control: a stream starts with 256 KiB of credit. The viewer sends
 CREDIT for the bytes it has written out. A viewer that falls more than
 4 MiB behind gets a fresh repaint instead of the backlog, once it has credit
-for one; its images come once output rests for 100 ms, or after 2 s if it never does.
+for one; its images come once output rests for 100 ms, or after 2 s if it never does,
+and no sooner than the line can spare. A viewer that missed nothing keeps its own.
 A paint never counts as falling behind, whatever its size. A stalled stream
 never blocks channel 0 or other streams.
 

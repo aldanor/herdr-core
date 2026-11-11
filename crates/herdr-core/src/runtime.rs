@@ -34,6 +34,7 @@ pub struct Core {
     /// Work for the runtime that the holder thread can't do itself.
     pub jobs: tokio::sync::mpsc::UnboundedSender<crate::notes::Job>,
     pub jobs_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::notes::Job>>>,
+    pub encoder_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u32>>>,
     /// Sweeps of lost terminals in flight: stop and restart wait for them.
     pub(crate) sweeps: Arc<std::sync::atomic::AtomicUsize>,
     /// Holder startup and goodbye cannot cross, or a stop could leave a new holder behind.
@@ -75,6 +76,8 @@ pub struct State {
     pub output_seq: HashMap<u32, u64>,
     /// Terminals a read is scrolling right now (viewers paused).
     pub stitching: HashSet<u32>,
+    /// Asks the encoder for what a paint had to leave out.
+    pub encoder: Option<tokio::sync::mpsc::UnboundedSender<u32>>,
     /// The last stitched read per terminal, good while it prints nothing:
     /// (output count after it, what it captured).
     pub stitched: HashMap<u32, (u64, crate::stitch::Capture)>,
@@ -180,6 +183,7 @@ impl Core {
         let machines = read_state(&paths.state.join("machines.json"))?;
         let peers = read_state(&paths.state.join("peers.json"))?;
         let (jobs, jobs_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (encoder, encoder_rx) = tokio::sync::mpsc::unbounded_channel();
         let core = Arc::new(Core {
             info,
             login_session: platform::login_session(),
@@ -188,10 +192,11 @@ impl Core {
             restart: Default::default(),
             registry_writer: RegistryWriter::new(paths.state.join("terminals.json"))?,
             paths,
-            state: Mutex::new(State { reg, docs, machines, peers, ..Default::default() }),
+            state: Mutex::new(State { reg, docs, machines, peers, encoder: Some(encoder), ..Default::default() }),
             changed: Notify::new(),
             jobs,
             jobs_rx: Mutex::new(Some(jobs_rx)),
+            encoder_rx: Mutex::new(Some(encoder_rx)),
             sweeps: Default::default(),
             holder_start: Default::default(),
             dirty: Default::default(),

@@ -197,6 +197,7 @@ impl Core {
                 return Some(answer);
             }
             st.gates.entry(id).or_default().set_busy(true);
+            crate::viewers::note_places(&mut st, id);
             st.stitching.insert(id);
         }
         let result = self.scroll_and_read(id, lines).await;

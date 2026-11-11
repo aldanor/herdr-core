@@ -123,6 +123,8 @@ fn request(observe: bool, resize_notifications: bool) -> AttachRequest {
 }
 
 const IMAGE: &[u8] = b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=2,r=1,C=1,q=2;AAAAAA==\x1b\\";
+const CHUNK_FIRST: &[u8] = b"\x1b_Ga=T,f=32,s=1,v=1,i=2,c=2,r=1,C=1,q=2,m=1;AAAA\x1b\\";
+const CHUNK_LAST: &[u8] = b"\x1b_Gm=0;AA==\x1b\\";
 
 impl Rig {
     fn new() -> Rig {
@@ -168,10 +170,10 @@ impl Rig {
     }
 
     fn viewer_as(&self, observe: bool, resize_notifications: bool) -> (Arc<Conn>, u32) {
-        self.rested();
         let (conn, channel) = self.attach(request(observe, resize_notifications));
         read(&conn, channel);
         // However long that took on a slow machine, it doesn't hold back what a test does next.
+        conn.with(|out| out.hold_images_until(channel, None));
         (conn, channel)
     }
 
@@ -186,7 +188,10 @@ impl Rig {
                 channel
             })
             .collect();
-        conn.with(|out| while out.next_frame().is_some() {});
+        conn.with(|out| {
+            while out.next_frame().is_some() {}
+            channels.iter().for_each(|channel| out.hold_images_until(*channel, None));
+        });
         channels
     }
 
@@ -204,14 +209,16 @@ impl Rig {
     }
 
     /// Output has rested and its line is free: what it's due goes.
-    fn due(&self, viewer: &Arc<Conn>, _channel: u32) {
+    fn due(&self, viewer: &Arc<Conn>, channel: u32) {
         self.rested();
+        viewer.with(|out| out.hold_images_until(channel, None));
         self.core.prepare_repaints(viewer);
     }
 
     fn needs_a_full_paint(&self) {
         self.with_viewer(|v| {
             v.repaint_pending = true;
+            v.whole = false;
         });
     }
 
@@ -225,7 +232,7 @@ impl Rig {
 
     /// The nth viewer is owed all its images, since then.
     fn owe(&self, n: usize, since: Instant) {
-        self.with_viewer_n(n, |v| v.owed = Some(Owed { since, carried: None, spare: false }));
+        self.with_viewer_n(n, |v| v.owed = Some(Owed { since, all: true, finished: 0, carried: None, layout: false }));
     }
 
     fn after_read(&self) {
@@ -239,7 +246,7 @@ impl Rig {
     }
 
     fn owed(&self) -> Option<bool> {
-        self.with_viewer(|v| v.owed.map(|_| true))
+        self.with_viewer(|v| v.owed.map(|o| o.all))
     }
 
     fn past_the_ceiling(&self) {
@@ -256,7 +263,16 @@ impl Rig {
     /// It starts missing output, as for a resize or a read.
     fn viewer_misses_output(&self) {
         let mut st = self.core.lock();
+        note_places(&mut st, self.id);
         st.viewers.get_mut(&self.id).unwrap().iter_mut().for_each(|v| v.repaint_pending = true);
+    }
+
+    /// All a running encoder would do by now.
+    fn encoder_ran(&self) {
+        while let Some(job) = self.core.next_encode(self.id) {
+            self.core.keep_encoded(self.id, job.run());
+        }
+        self.core.encoding_finished(self.id);
     }
 
     /// Overflows a viewer so it falls behind, with nothing read and nothing scrolled.
@@ -390,6 +406,75 @@ fn output_that_never_rests_holds_images_back_only_so_long() {
 }
 
 #[test]
+fn a_viewer_attached_during_a_load_gets_it_once_output_rests_and_only_then() {
+    let (rig, viewer, channel) = Rig::late(&[IMAGE, CHUNK_FIRST]);
+    assert_eq!(rig.owed(), Some(false));
+    PAINTS.set(0);
+
+    rig.rested();
+    assert_eq!(rig.core.prepare_repaints(&viewer), None, "only more output can change anything");
+    rig.past_the_ceiling();
+    assert_eq!(rig.core.prepare_repaints(&viewer), None, "a load that never ends can't repaint forever");
+    assert_eq!(PAINTS.get(), 0);
+
+    rig.output(CHUNK_LAST);
+    read(&viewer, channel);
+    rig.far_from_the_ceiling();
+    rig.flowing();
+    assert!(rig.core.prepare_repaints(&viewer).is_some());
+    assert_eq!(PAINTS.get(), 0, "the next image may be on its way");
+
+    rig.rested();
+    rig.core.prepare_repaints(&viewer);
+    assert_eq!(PAINTS.get(), 1);
+    assert_eq!(rig.owed(), None);
+    assert!(carries_images(&read(&viewer, channel)));
+}
+
+#[test]
+fn images_arriving_one_after_another_cost_one_repaint() {
+    let (rig, viewer, channel) = Rig::late(&[CHUNK_FIRST]);
+    rig.far_from_the_ceiling();
+    PAINTS.set(0);
+    rig.output(CHUNK_LAST);
+    for id in 3..9 {
+        rig.output(format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},q=2,m=1;AAAA\x1b\\").as_bytes());
+        rig.core.prepare_repaints(&viewer);
+        rig.output(CHUNK_LAST);
+        rig.flowing();
+        assert!(rig.core.prepare_repaints(&viewer).is_some(), "the next may be");
+    }
+    assert_eq!(PAINTS.get(), 0);
+    rig.rested();
+    rig.core.prepare_repaints(&viewer);
+    assert_eq!(PAINTS.get(), 1);
+    read(&viewer, channel);
+    rig.output(IMAGE);
+    rig.rested();
+    assert_eq!(rig.core.prepare_repaints(&viewer), None);
+    assert_eq!(PAINTS.get(), 1, "it has them all, and the stream carries the rest");
+}
+
+#[test]
+fn a_viewer_left_with_no_images_during_a_stuck_load_gets_those_it_can_once() {
+    let (rig, viewer, channel) = Rig::late(&[IMAGE]);
+    rig.output(CHUNK_FIRST);
+    rig.overflow();
+    rig.flowing();
+    rig.core.prepare_repaints(&viewer);
+    assert!(!carries_images(&read(&viewer, channel)));
+    assert_eq!(rig.owed(), Some(true));
+    rig.far_from_the_ceiling();
+    rig.rested();
+    assert!(rig.core.prepare_repaints(&viewer).is_some(), "rest alone won't do: a load is open");
+    rig.past_the_ceiling();
+    rig.core.prepare_repaints(&viewer);
+    assert!(carries_images(&read(&viewer, channel)));
+    assert_eq!(rig.owed(), Some(false), "still short of the one arriving");
+    assert_eq!(rig.core.prepare_repaints(&viewer), None);
+}
+
+#[test]
 fn a_read_repaints_a_free_viewer_at_once_and_waits_for_one_receiving_a_paint() {
     let rig = Rig::new();
     rig.output(IMAGE);
@@ -405,6 +490,7 @@ fn a_read_repaints_a_free_viewer_at_once_and_waits_for_one_receiving_a_paint() {
     assert_eq!(PAINTS.get(), 1);
     assert!(carries_images(&read(&viewer, channel)), "a read isn't a flood");
     assert!(!rig.with_viewer(|v| v.repaint_pending), "this was the repaint");
+    viewer.with(|out| out.hold_images_until(channel, None));
 
     viewer.with(|out| out.paint(channel, &vec![b'p'; wire::WINDOW / 2]));
     PAINTS.set(0);
@@ -421,6 +507,7 @@ fn a_read_paints_those_it_can_and_leaves_the_rest_their_paint() {
     let (rig, free, free_channel) = Rig::late(&[IMAGE]);
     let (busy, busy_channel) = rig.viewer();
     busy.with(|out| out.paint(busy_channel, &vec![b'p'; wire::WINDOW / 2]));
+    rig.with_viewer(|v| v.whole = false);
     rig.after_read();
     assert!(carries_images(&read(&free, free_channel)));
     assert_eq!(read(&busy, busy_channel), vec![b'p'; wire::WINDOW / 2]);
@@ -451,17 +538,20 @@ fn a_repaint_says_whether_what_follows_it_needs_recovering() {
     rig.core.prepare_repaints(&viewer);
     assert!(!rig.with_viewer(|v| v.recovering), "at ground, the stream can follow it as it is");
     read(&viewer, channel);
+    viewer.with(|out| out.hold_images_until(channel, None));
 
     rig.with_viewer(|v| v.recovering = true);
     rig.after_read();
     assert!(!rig.with_viewer(|v| v.recovering));
     read(&viewer, channel);
+    viewer.with(|out| out.hold_images_until(channel, None));
 
     rig.open_long_sequence();
     rig.with_viewer(|v| v.repaint_pending = true);
     rig.core.prepare_repaints(&viewer);
     assert!(rig.with_viewer(|v| v.recovering), "mid-way through something too long to replay");
     read(&viewer, channel);
+    viewer.with(|out| out.hold_images_until(channel, None));
     rig.after_read();
     assert!(rig.with_viewer(|v| v.recovering));
 }
@@ -475,6 +565,16 @@ fn a_paint_built_mid_sequence_ends_with_what_lets_the_rest_of_it_land() {
     rig.output(b"\x1b\\");
     let paint = first_paint(&rig.core.lock(), rig.id, 0);
     assert!(!paint.ends_with(b"half"), "that sequence has ended");
+}
+
+#[test]
+fn a_read_during_a_load_leaves_that_image_owed() {
+    let rig = Rig::new();
+    let (viewer, channel) = rig.viewer();
+    rig.output(CHUNK_FIRST);
+    rig.after_read();
+    read(&viewer, channel);
+    assert_eq!(rig.owed(), Some(false));
 }
 
 #[test]
@@ -512,6 +612,18 @@ fn a_viewer_waiting_for_a_repaint_is_not_recovered_as_well() {
 }
 
 #[test]
+fn a_recovered_viewer_of_a_screen_with_no_images_is_cleared_too() {
+    let rig = Rig::new();
+    let (viewer, channel) = rig.viewer();
+    rig.open_long_sequence();
+    rig.with_viewer(|v| v.recovering = true);
+    read(&viewer, channel);
+    viewer.with(|out| out.hold_images_until(channel, None));
+    rig.output(b"AA\x1b\\");
+    assert!(read(&viewer, channel).windows(3).any(|w| w == b"d=R"));
+}
+
+#[test]
 fn a_recovered_viewer_gets_the_images_later_like_any_repaint_while_output_flows() {
     let (rig, viewer, channel) = Rig::late(&[IMAGE]);
     rig.open_long_sequence();
@@ -524,6 +636,58 @@ fn a_recovered_viewer_gets_the_images_later_like_any_repaint_while_output_flows(
     assert_eq!(rig.owed(), Some(true));
 }
 
+#[test]
+fn a_resize_drag_repaints_without_images_until_it_ends() {
+    let (rig, leader, channel) = Rig::late(&[IMAGE]);
+    let (observer, observed) = rig.viewer_as(true, true);
+    let observer_index = 1;
+    rig.core.lock().viewers.get_mut(&rig.id).unwrap()[observer_index].whole = false;
+    rig.rested();
+    rig.core.viewer_resize(&leader, channel, 120, 24);
+    rig.rested();
+    let owed = |rig: &Rig| rig.core.lock().viewers[&rig.id][observer_index].owed.map(|o| o.all);
+    rig.core.prepare_repaints(&observer);
+    assert!(!carries_images(&read(&observer, observed)), "the drag may go on, though output is quiet");
+    assert_eq!(owed(&rig), Some(true));
+    rig.core.lock().viewers.get_mut(&rig.id).unwrap()[observer_index].resized_at = Some(Instant::now() - IMAGES_REST);
+    rig.core.prepare_repaints(&observer);
+    assert!(carries_images(&read(&observer, observed)));
+    assert_eq!(owed(&rig), None);
+}
+
+#[test]
+fn a_program_ending_paints_what_viewers_are_owed_with_images() {
+    let (rig, viewer, channel) = Rig::late(&[IMAGE]);
+    rig.output(CHUNK_FIRST);
+    rig.output(CHUNK_LAST);
+    rig.owe(0, Instant::now());
+    rig.with_viewer(|v| v.whole = false);
+    read(&viewer, channel);
+    rig.flowing();
+    rig.core.queue_repaints(&mut rig.core.lock(), rig.id, None);
+    assert!(carries_images(&read(&viewer, channel)));
+}
+
+#[test]
+fn a_screen_with_no_images_owes_none_however_it_was_painted() {
+    let rig = Rig::new();
+    let (viewer, channel) = rig.viewer();
+    rig.overflow();
+    rig.flowing();
+    rig.core.prepare_repaints(&viewer);
+    assert_eq!(read(&viewer, channel)[0], 0x18);
+    assert_eq!(rig.owed(), None);
+    assert_eq!(rig.core.prepare_repaints(&viewer), None, "so the writer has nothing to wake for");
+
+    rig.output(IMAGE);
+    rig.output(&b"\n".repeat(30));
+    rig.overflow();
+    rig.flowing();
+    rig.core.prepare_repaints(&viewer);
+    read(&viewer, channel);
+    assert_eq!(rig.owed(), None, "nor does one whose images have all scrolled away");
+}
+
 /// Output resting takes 100 ms for both; only one of them is 50 ms from the ceiling.
 #[track_caller]
 fn looks_again_for_the_first_due(rig: &Rig, conn: &Arc<Conn>, owed: [(u32, usize); 2]) {
@@ -533,7 +697,8 @@ fn looks_again_for_the_first_due(rig: &Rig, conn: &Arc<Conn>, owed: [(u32, usize
         for ((id, n), since) in owed.into_iter().zip([first, second]) {
             let mut st = rig.core.lock();
             st.last_output.insert(id, far);
-            st.viewers.get_mut(&id).unwrap()[n].owed = Some(Owed { since, carried: None, spare: false });
+            st.viewers.get_mut(&id).unwrap()[n].owed =
+                Some(Owed { since, all: true, finished: 0, carried: None, layout: false });
         }
         let wait = rig.core.prepare_repaints(conn).unwrap_or_default();
         assert!(wait <= Duration::from_millis(50), "{wait:?}");
@@ -561,6 +726,177 @@ fn a_writer_looks_again_for_whichever_of_its_terminals_is_due_first() {
     let conn = Arc::new(Conn::default());
     rig.viewers_on(&conn, &[rig.id, other]);
     looks_again_for_the_first_due(&rig, &conn, [(rig.id, 0), (other, 0)]);
+}
+
+#[test]
+fn how_soon_images_are_due_follows_rest_load_ceiling_and_the_line() {
+    let rig = Rig::new();
+    let (_viewer, _) = rig.viewer();
+    let now = Instant::now();
+    let due = |all, age: Duration, quiet: Duration, hold, open, finished| {
+        rig.with_viewer(|v| {
+            v.owed = Some(Owed { since: now - age, all, finished: 5, carried: None, layout: false });
+            v.images_due_in(quiet, hold, LoadsNow { open, finished }, now)
+        })
+    };
+    let ms = Duration::from_millis;
+    let none = Duration::ZERO;
+    assert_eq!(due(true, ms(0), ms(30), none, false, 5), Some(ms(70)), "the rest left");
+    assert_eq!(due(true, ms(0), ms(500), none, false, 5), Some(ms(0)));
+    assert_eq!(due(true, IMAGES_AT_MOST - ms(10), ms(0), none, false, 5), Some(ms(10)), "the ceiling, if sooner");
+    assert_eq!(due(false, IMAGES_AT_MOST + ms(1), ms(0), none, false, 5), Some(ms(0)));
+    assert_eq!(due(false, ms(0), ms(500), none, true, 5), None, "only short of one that may never finish");
+    assert_eq!(due(false, ms(0), ms(30), none, true, 6), Some(ms(70)), "but one finished since");
+    assert_eq!(due(false, IMAGES_AT_MOST - ms(10), ms(0), none, true, 6), Some(ms(10)), "output not resting");
+    assert_eq!(due(true, ms(500), ms(500), none, true, 5), Some(IMAGES_AT_MOST - ms(500)));
+    assert_eq!(due(true, ms(0), ms(500), ms(900), false, 5), Some(ms(900)), "a slow line comes first");
+    assert_eq!(due(true, ms(0), ms(50), ms(70), false, 5), Some(ms(70)), "whichever is longer, not both");
+    assert_eq!(due(false, ms(0), ms(500), ms(900), true, 5), None);
+    rig.with_viewer(|v| v.owed = None);
+    assert_eq!(rig.with_viewer(|v| v.images_due_in(ms(500), none, LoadsNow::default(), now)), None);
+}
+
+#[test]
+fn a_repaint_goes_without_images_while_a_slow_line_still_recovers_from_the_last() {
+    let (rig, viewer, channel) = Rig::late(&[IMAGE]);
+    viewer.with(|out| out.hold_images_until(channel, Some(Instant::now() + Duration::from_secs(3600))));
+    rig.overflow();
+    rig.rested();
+    rig.core.prepare_repaints(&viewer);
+    assert!(!carries_images(&read(&viewer, channel)), "output rested, but the line hasn't");
+    assert_eq!(rig.owed(), Some(true));
+    rig.far_from_the_ceiling();
+    assert!(rig.core.prepare_repaints(&viewer).is_some(), "and the writer looks again");
+
+    rig.after_read();
+    assert!(rig.with_viewer(|v| v.repaint_pending), "a read waits for the line too");
+}
+
+#[test]
+fn viewers_painted_together_each_get_what_is_due_to_them() {
+    let rig = Rig::new();
+    rig.output(IMAGE);
+    let conn = Arc::new(Conn::default());
+    let channels = rig.viewers_on(&conn, &[rig.id, rig.id]);
+    let (behind, owed) = (channels[0], channels[1]);
+    rig.needs_a_full_paint();
+    rig.owe(1, Instant::now() - IMAGES_AT_MOST);
+    rig.with_viewer_n(1, |v| v.whole = false);
+    rig.flowing();
+    PAINTS.set(0);
+    rig.core.prepare_repaints(&conn);
+    assert_eq!(PAINTS.get(), 2, "one of each");
+    let mut got = std::collections::HashMap::<u32, Vec<u8>>::new();
+    conn.with(|out| {
+        while let Some(frame) = out.next_frame() {
+            if frame[4] == wire::DATA {
+                let channel = u32::from_le_bytes(frame[..4].try_into().unwrap());
+                got.entry(channel).or_default().extend_from_slice(&frame[wire::HEADER..]);
+            }
+        }
+    });
+    assert!(!carries_images(&got[&behind]), "output is flowing");
+    assert!(carries_images(&got[&owed]), "and this one has waited long enough");
+    let owed_after: Vec<Option<bool>> =
+        rig.core.lock().viewers[&rig.id].iter().map(|v| v.owed.map(|o| o.all)).collect();
+    assert_eq!(owed_after, [Some(true), None]);
+}
+
+#[test]
+fn every_paint_with_images_holds_back_the_next_and_text_only_ones_do_not() {
+    let rig = Rig::new();
+    rig.output(IMAGE);
+    let held = |viewer: &Arc<Conn>, channel, since| !viewer.outbox().images_wait(channel, since).is_zero();
+    let (conn, channel) = rig.attach(request(false, false));
+    let since = Instant::now();
+    read(&conn, channel);
+    assert!(held(&conn, channel, since), "a first paint");
+
+    conn.with(|out| out.hold_images_until(channel, None));
+    rig.overflow();
+    rig.rested();
+    rig.core.prepare_repaints(&conn);
+    let since = Instant::now();
+    read(&conn, channel);
+    assert!(held(&conn, channel, since), "a repaint");
+
+    conn.with(|out| out.hold_images_until(channel, None));
+    rig.with_viewer(|v| v.whole = false);
+    rig.after_read();
+    let since = Instant::now();
+    read(&conn, channel);
+    assert!(held(&conn, channel, since), "after a read");
+
+    conn.with(|out| out.hold_images_until(channel, None));
+    rig.overflow();
+    rig.flowing();
+    rig.core.prepare_repaints(&conn);
+    let since = Instant::now();
+    read(&conn, channel);
+    assert!(!held(&conn, channel, since), "text alone doesn't");
+}
+
+#[test]
+fn a_finished_image_is_not_held_back_by_the_next_one_stopping_half_way() {
+    let (rig, viewer, channel) = Rig::late(&[CHUNK_FIRST]);
+    rig.output(CHUNK_LAST);
+    rig.output(b"text\r\n\x1b_Ga=T,f=32,s=1,v=1,i=3,q=2,m=1;AAAA\x1b\\");
+    read(&viewer, channel);
+    rig.rested();
+    PAINTS.set(0);
+    rig.core.prepare_repaints(&viewer);
+    assert_eq!(PAINTS.get(), 1, "the first has finished");
+    assert!(carries_images(&read(&viewer, channel)));
+    assert_eq!(rig.owed(), Some(false), "still short of the one arriving");
+    viewer.with(|out| out.hold_images_until(channel, None));
+    rig.rested();
+    assert_eq!(rig.core.prepare_repaints(&viewer), None, "and nothing new until something happens");
+    assert_eq!(PAINTS.get(), 1);
+}
+
+#[test]
+fn a_load_left_open_on_the_other_screen_holds_nothing_back() {
+    let (rig, viewer, channel) = Rig::late(&[CHUNK_FIRST, b"\x1b[?1049h\x1b_Ga=T,f=32,s=1,v=1,i=3,q=2,m=1;AAAA\x1b\\"]);
+    rig.output(CHUNK_LAST);
+    read(&viewer, channel);
+    rig.rested();
+    PAINTS.set(0);
+    rig.core.prepare_repaints(&viewer);
+    assert_eq!(PAINTS.get(), 1);
+    assert!(carries_images(&read(&viewer, channel)));
+}
+
+#[test]
+fn images_a_first_paint_had_no_time_for_follow_it_in_one_more_paint() {
+    let rig = Rig::new();
+    for id in 11..=14 {
+        rig.output(format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c=2,r=1,C=1,q=2;AAAAAA==\x1b\\").as_bytes());
+    }
+    rig.core.lock().screens[&rig.id].set_inline_pixels(0);
+    let (viewer, channel) = rig.viewer();
+    assert_eq!(rig.owed(), Some(true), "all four owed");
+    PAINTS.set(0);
+    rig.rested();
+    rig.core.prepare_repaints(&viewer);
+    assert_eq!(PAINTS.get(), 0, "nothing is sent while there's more to encode");
+    rig.encoder_ran();
+    rig.core.prepare_repaints(&viewer);
+    assert_eq!(PAINTS.get(), 1, "and with that, one paint");
+    let paint = read(&viewer, channel);
+    assert_eq!(paint.windows(4).filter(|w| *w == b"a=t,").count(), 4);
+    assert_eq!(rig.owed(), None);
+}
+
+#[test]
+fn a_repaint_of_a_screen_with_no_images_clears_what_a_viewer_kept() {
+    let (rig, viewer, channel) = Rig::late(&[b"\x1b_Ga=T,f=32,s=1,v=1,U=1,i=1,c=2,r=1,q=2;AAAAAA==\x1b\\"]);
+    rig.output(b"\x1b_Ga=d,d=I,i=1,q=2\x1b\\");
+    rig.overflow();
+    rig.flowing();
+    rig.core.prepare_repaints(&viewer);
+    let paint = read(&viewer, channel);
+    assert!(paint.windows(3).any(|w| w == b"d=R"), "output is flowing, but nothing's left to hold back");
+    assert_eq!(rig.owed(), None);
 }
 
 #[test]
@@ -595,4 +931,8 @@ fn a_first_paint_of_any_size_arrives_whole() {
     let (conn, channel) = rig.attach(AttachRequest { history: 200_000, ..request(false, false) });
     assert!(read(&conn, channel).len() > wire::MAX_PENDING);
     assert!(!rig.core.lock().viewers[&rig.id][0].repaint_pending);
+}
+
+fn leaves_images_alone(paint: &[u8]) -> bool {
+    !paint.is_empty() && !paint.windows(3).any(|w| w == b"\x1b_G")
 }

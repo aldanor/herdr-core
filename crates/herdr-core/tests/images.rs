@@ -202,6 +202,69 @@ fn an_image_framed_with_empty_first_and_last_commands_survives_a_recovery() {
     assert_eq!(ids(&stalled), [9, 10]);
 }
 
+/// A program that sends the first half of an image, waits, then the rest.
+fn half_then_rest(s: &Session) -> (String, std::path::PathBuf) {
+    let (terminal, resume) = half_after_go(s);
+    go(s);
+    printed(s, &terminal, "HALFWAY");
+    (terminal, resume)
+}
+
+fn half_after_go(s: &Session) -> (String, std::path::PathBuf) {
+    let whole = chunked("a=T,f=32,s=300,v=300,i=8,c=4,r=2,q=2", &vec![5u8; 300 * 300 * 4]);
+    let cut = cut_after_four(&whole);
+    let (first, rest, resume) = (s.root.join("first"), s.root.join("rest"), s.root.join("resume"));
+    std::fs::write(&first, &whole[..cut]).unwrap();
+    std::fs::write(&rest, &whole[cut..]).unwrap();
+    let program = after_go(
+        s,
+        &format!(
+            "cat {}; printf HALFWAY; while [ ! -e {} ]; do sleep 0.01; done; cat {}; printf '\\r\\nDONE\\r\\n'; sleep 100",
+            first.display(),
+            resume.display(),
+            rest.display()
+        ),
+    );
+    (run(s, &["sh", "-c", &program]), resume)
+}
+
+#[test]
+fn a_viewer_attached_during_a_transfer_gets_that_image_when_it_ends() {
+    let s = Session::new();
+    let (t, resume) = half_then_rest(&s);
+    std::thread::sleep(Duration::from_millis(300));
+    let mut v = watch(&s, &t);
+    v.drain(Duration::from_millis(100));
+    assert!(ids(&v).is_empty(), "nothing to show yet");
+    std::fs::write(&resume, "").unwrap();
+    v.shows("DONE");
+    v.until("the image", |v| !v.screen.image_placements().is_empty());
+    assert_eq!(ids(&v), [8]);
+}
+
+#[test]
+fn a_repaint_during_a_transfer_leaves_a_healthy_viewer_with_that_image() {
+    let s = Session::new();
+    let (t, resume) = half_after_go(&s);
+    // There from before the first chunk, so it has had all of them so far.
+    let mut healthy = Viewer::attach(&s, &t, 80, 24, json!({"observe": true, "resize_notifications": true}));
+    healthy.drain(Duration::from_millis(300));
+    go(&s);
+    printed(&s, &t, "HALFWAY");
+    healthy.shows("HALFWAY");
+    // Another viewer changes the grid: the observer is repainted, mid-transfer.
+    let before = healthy.received;
+    let mut leader = Viewer::attach(&s, &t, 70, 20, json!({}));
+    leader.drain(Duration::from_millis(100));
+    healthy.drain(Duration::from_millis(200));
+    assert!(healthy.received > before, "the repaint came before the rest of the image");
+    assert!(ids(&healthy).is_empty(), "nor is the image there yet");
+    std::fs::write(&resume, "").unwrap();
+    healthy.shows("DONE");
+    healthy.until("the image", |v| !v.screen.image_placements().is_empty());
+    assert_eq!(ids(&healthy), [8]);
+}
+
 #[test]
 fn a_stream_of_images_does_not_repaint_a_viewer_for_every_image() {
     let s = Session::new();
@@ -290,6 +353,7 @@ fn reading_a_full_screen_app_keeps_its_images_on_attached_viewers() {
     v.drain(Duration::from_millis(300));
     assert!(v.raw.contains(&0x18), "the read scrolled and repainted");
     assert_eq!(ids(&v), [1]);
+    assert!(!v.raw.windows(3).any(|w| w == b"\x1b_G"), "and it had missed nothing, so the image stayed");
 }
 
 #[test]
@@ -375,6 +439,23 @@ fn a_clear_dropped_by_a_resize_does_not_leave_a_viewer_its_image() {
     grant(&mut observer);
     observer.shows("DONE");
     observer.until("the image gone", |v| v.screen.image_placements().is_empty());
+}
+
+#[test]
+fn an_image_sent_before_a_viewer_attached_and_placed_after_reaches_it() {
+    let s = Session::new();
+    let mut first = b"\x1b[?1049h\x1b[H".to_vec();
+    first.extend(chunked("a=t,f=100,i=5,q=2", &png_filled(8, 4, [255, 0, 0, 255])));
+    first.extend(b"READY\r\n");
+    let t = script(&s, &first, b"\x1b_Ga=p,i=5,p=1,c=4,r=2,C=1,q=2\x1b\\PLACED\r\n");
+    printed(&s, &t, "READY");
+    let mut viewer = watch(&s, &t);
+    viewer.shows("READY");
+    assert_eq!(viewer.screen.image_placements().len(), 0, "it's only been sent");
+    go(&s);
+    viewer.shows("PLACED");
+    viewer.until("the image", |v| v.screen.image_placements().len() == 1);
+    assert_eq!(viewer.screen.image_pixels(5).unwrap(), [255, 0, 0, 255].repeat(8 * 4));
 }
 
 #[test]

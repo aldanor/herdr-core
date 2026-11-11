@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::testing::{base64, chunked, count, noise, placed, placeholder_cells, same_image};
+/// As long as a test may take: only some are about running out of time.
+const FOREVER: usize = usize::MAX;
+use crate::testing::{base64, chunked, count, dot, noise, placed, placeholder_cells, same_image};
 use kitty::tests::png_of;
 
 /// One kitty command, base64 included, without chunks.
@@ -22,6 +24,26 @@ fn placeholder_png() -> Vec<u8> {
 
 fn ids(t: &Terminal) -> Vec<u32> {
     t.image_placements().iter().map(|p| p.image).collect()
+}
+
+/// Runs the encoder dry, and says if it asks for more than `most` jobs.
+#[track_caller]
+fn settle(a: &mut Terminal, most: usize, why: &str) {
+    let mut jobs = 0;
+    while let Some(job) = a.next_encode() {
+        a.encoded(job.run());
+        jobs += 1;
+        assert!(jobs <= most, "{why}");
+    }
+}
+
+#[test]
+fn png_images_move_the_cursor_like_a_viewer_does() {
+    let mut t = Terminal::new(80, 24, 1 << 20);
+    t.write(b"png[");
+    t.write(&image("a=T,f=100,i=1,c=4,r=3", &png_of(8, 6)));
+    t.write(b"]x");
+    assert_eq!(t.screen_rows()[2].trim_end(), "        ]x");
 }
 
 #[test]
@@ -204,7 +226,7 @@ fn replayed_images_keep_their_ids_so_placeholder_cells_still_name_them() {
 fn tried_once(a: &Terminal) {
     kitty::tests::ENCODES.set(0);
     for _ in 0..3 {
-        assert!(a.images_within(1000).direct.is_empty());
+        assert!(a.images_within(1000, FOREVER).direct.is_empty());
     }
     assert_eq!(kitty::tests::ENCODES.get(), 1);
 }
@@ -222,8 +244,8 @@ fn an_image_too_big_for_a_paint_is_encoded_once_however_many_places_it_has() {
         "and keeps no bytes for it"
     );
     kitty::tests::ENCODES.set(0);
-    assert!(!a.images_within(100_000).direct.is_empty(), "it fits a larger paint");
-    let _ = a.images_within(100_000);
+    assert!(!a.images_within(100_000, FOREVER).direct.is_empty(), "it fits a larger paint");
+    let _ = a.images_within(100_000, FOREVER);
     assert_eq!(kitty::tests::ENCODES.get(), 1, "which then reuses it");
 }
 
@@ -364,7 +386,7 @@ fn in_a_tight_paint_direct_images_go_before_placeholder_ones_and_the_newest_firs
     let mut a = Terminal::new(80, 24, 1 << 20);
     a.write(&chunked("a=T,f=32,s=100,v=100,i=1,c=2,r=1,C=1,q=2", &noise(40_000)));
     a.write(&chunked("a=T,f=32,s=100,v=100,U=1,i=2,c=4,r=1,q=2", &noise(40_000)));
-    let one = a.images_within(60_000);
+    let one = a.images_within(60_000, FOREVER);
     assert_eq!(count(&one.direct, b"a=t,"), 1);
     assert_eq!(count(&one.placeholder, b"a=t,"), 0);
 
@@ -373,7 +395,7 @@ fn in_a_tight_paint_direct_images_go_before_placeholder_ones_and_the_newest_firs
         many.write(&chunked(&format!("a=T,f=32,s=100,v=100,i={id},c=2,r=1,C=1,q=2"), &noise(40_000)));
     }
     let mut viewer = Terminal::new(80, 24, 1 << 20);
-    viewer.write(&many.images_within(60_000).direct);
+    viewer.write(&many.images_within(60_000, FOREVER).direct);
     assert_eq!(ids(&viewer), [8]);
 }
 
@@ -383,7 +405,7 @@ fn a_paint_carries_at_most_so_many_images_and_placements() {
     for id in 1..=300 {
         images.write(&image(&format!("a=T,f=100,i={id},c=1,r=1,C=1"), &png_of(1, 1)));
     }
-    let direct = images.images_within(1 << 20).direct;
+    let direct = images.images_within(1 << 20, FOREVER).direct;
     assert_eq!(count(&direct, b"a=t,"), 256);
     assert_eq!(count(&direct, b"a=p,"), 256);
 
@@ -392,7 +414,19 @@ fn a_paint_carries_at_most_so_many_images_and_placements() {
     for _ in 0..1100 {
         places.write(b"\x1b_Ga=p,i=1,c=1,r=1,C=1,q=2\x1b\\");
     }
-    assert_eq!(count(&places.images_within(1 << 20).direct, b"a=p,"), 1024);
+    assert_eq!(count(&places.images_within(1 << 20, FOREVER).direct, b"a=p,"), 1024);
+}
+
+#[test]
+fn once_the_budget_is_spent_nothing_more_is_encoded() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&chunked("a=T,f=32,s=100,v=100,i=1,c=2,r=1,C=1,q=2", &noise(40_000)));
+    a.write(&chunked("a=T,f=32,s=100,v=100,i=2,c=2,r=1,C=1,q=2", &noise(40_000)));
+    let exact = a.images_within(60_000, FOREVER).direct.len();
+    a.encoded[0].borrow_mut().clear();
+    kitty::tests::ENCODES.set(0);
+    assert_eq!(a.images_within(exact, FOREVER).direct.len(), exact);
+    assert_eq!(kitty::tests::ENCODES.get(), 1);
 }
 
 #[test]
@@ -554,14 +588,58 @@ fn an_image_exactly_as_big_as_what_is_left_fits_cached_or_not() {
     let mut a = Terminal::new(80, 24, 1 << 20);
     a.write(&chunked("a=T,f=32,s=100,v=100,i=1,U=1,c=4,r=1,q=2", &noise(40_000)));
     let exact = {
-        let replay = a.images_within(1 << 20);
+        let replay = a.images_within(1 << 20, FOREVER);
         count(&replay.placeholder, b"a=t,");
         a.encoded[0].borrow_mut().clear();
         kitty::tests::encoded_len(&a.image(1).unwrap())
     };
-    assert_eq!(count(&a.images_within(exact).placeholder, b"a=t,"), 1, "fresh");
-    assert_eq!(count(&a.images_within(exact - 1).placeholder, b"a=t,"), 0, "a byte short");
-    assert_eq!(count(&a.images_within(exact).placeholder, b"a=t,"), 1, "and known by then to be that big");
+    assert_eq!(count(&a.images_within(exact, FOREVER).placeholder, b"a=t,"), 1, "fresh");
+    assert_eq!(count(&a.images_within(exact - 1, FOREVER).placeholder, b"a=t,"), 0, "a byte short");
+    assert_eq!(count(&a.images_within(exact, FOREVER).placeholder, b"a=t,"), 1, "and known by then to be that big");
+}
+
+#[test]
+fn a_paint_leaves_what_it_may_not_encode_and_carries_what_the_encoder_made() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    for id in 1..=3 {
+        a.write(&small(id));
+    }
+    for carried in 0..3 {
+        let replay = a.images_within(1 << 20, 0);
+        assert_eq!((count(&replay.direct, b"a=t,"), replay.carried.deferred), (carried, true));
+        a.encoded(a.next_encode().unwrap().run());
+    }
+    assert!(a.next_encode().is_none());
+    kitty::tests::ENCODES.set(0);
+    let replay = a.images_within(1 << 20, 0);
+    assert_eq!((count(&replay.direct, b"a=t,"), replay.carried.deferred), (3, false));
+    assert_eq!(kitty::tests::ENCODES.get(), 0, "all cached by now");
+}
+
+#[test]
+fn what_the_encoder_made_of_an_image_since_replaced_goes_nowhere() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.set_inline_pixels(0);
+    a.write(&dot("i=1,c=2,r=1,C=1", [1, 2, 3, 4]));
+    let job = a.next_encode().unwrap();
+    a.write(&dot("i=1,c=2,r=1,C=1", [9; 4]));
+    a.encoded(job.run());
+    a.encoded(a.next_encode().unwrap().run());
+    assert_eq!(fresh(&a.paint_ready(0)).image_pixels(1).unwrap(), [9, 9, 9, 9]);
+}
+
+#[test]
+fn small_images_need_no_encoder_and_large_ones_wait_for_it() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&small(1));
+    let side = 300u32;
+    a.write(&chunked(&format!("a=T,f=32,s={side},v={side},i=2,c=2,r=1,C=1,q=2"), &noise((side * side * 4) as usize)));
+    let paint = a.paint_ready(0);
+    assert_eq!(count(&paint, b"a=t,"), 1);
+    assert!(a.images_carried().deferred);
+    settle(&mut a, 1, "only the large one");
+    let _ = a.paint_ready(0);
+    assert!(!a.images_carried().deferred, "and it says so when they are done");
 }
 
 #[test]
@@ -676,6 +754,7 @@ fn a_paint_says_what_it_carried_and_what_it_could_not() {
     a.write(&chunked("a=T,f=100,i=1,c=2,r=1,C=1,q=2", &png_of(2, 2)));
     let _ = a.paint(0);
     let first = a.images_carried();
+    assert!(!first.refused && !first.deferred);
     let _ = a.paint(0);
     assert_eq!(a.images_carried().images, first.images, "the same ones");
     a.write(&chunked("a=T,f=100,i=2,c=2,r=1,C=1,q=2", &png_of(2, 2)));
@@ -709,4 +788,299 @@ fn a_repaint_at_a_marked_prompt_adds_nothing_to_a_viewers_history() {
     used.write(&page);
     used.write(&screen.paint(0));
     assert_eq!(used.history_rows(), history + 10, "a first paint scrolls what was there out of the way");
+}
+
+#[test]
+fn the_encoder_is_done_when_the_budget_is_spent() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.set_inline_pixels(0);
+    let side = 1000u32;
+    for id in 1..=3 {
+        a.write(&chunked(
+            &format!("a=T,f=32,s={side},v={side},i={id},c=2,r=1,C=1,q=2"),
+            &noise((side * side * 4) as usize),
+        ));
+    }
+    settle(&mut a, 3, "however often it's asked");
+    assert!(!a.images_ready() || a.images_carried().refused);
+    assert!(a.images_ready());
+}
+
+fn three_wide() -> Terminal {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    for id in 1..=3 {
+        a.write(&chunked(&format!("a=T,f=32,s=4,v=2,i={id},c=2,r=1,C=1,q=2"), &[7; 32]));
+    }
+    a
+}
+
+#[test]
+fn what_a_paint_may_encode_on_the_spot_is_for_the_whole_paint() {
+    let a = three_wide();
+    let replay = a.images_within(1 << 20, 64);
+    assert_eq!(count(&replay.direct, b"a=t,"), 2);
+    assert!(replay.carried.deferred);
+}
+
+#[test]
+fn the_encoder_starts_with_what_a_paint_wants_most() {
+    let a = three_wide();
+    a.encoded(a.next_encode().unwrap().run());
+    let replay = a.images_within(1 << 20, 0);
+    assert_eq!(count(&replay.direct, b"a=t,"), 1);
+    assert_eq!(count(&replay.direct, b"a=t,f=100,i=3,"), 1, "the newest");
+}
+
+/// Whether the paint a viewer would get now, from what is encoded, carries image 1.
+fn carries_the_first(a: &Terminal) -> bool {
+    count(&a.images_within(1 << 20, 0).direct, b"a=t,f=100,i=1,") == 1
+}
+
+/// What a later command could tell apart.
+fn same_images(a: &Terminal, b: &Terminal, why: &str) {
+    let places = |t: &Terminal| {
+        let mut places: Vec<_> = t
+            .image_placements()
+            .iter()
+            .map(|p| (p.image, p.id, p.virtual_, p.row, p.col, p.cells, p.source, p.z))
+            .collect();
+        places.sort();
+        places
+    };
+    assert_eq!(places(a), places(b), "{why}");
+    for p in a.image_placements() {
+        assert_eq!(a.image_pixels(p.image), b.image_pixels(p.image), "{why}");
+    }
+    assert_eq!(a.plain_text(), b.plain_text(), "{why}");
+    assert_eq!(a.alt_screen(), b.alt_screen(), "{why}");
+}
+
+#[test]
+fn a_paint_keeping_images_changes_nothing_a_later_command_could_tell() {
+    let raw = |control: &str, byte: u8| image(control, &[byte; 4]);
+    let steps: Vec<Vec<u8>> = vec![
+        raw("a=T,f=32,s=1,v=1,c=2,r=1,q=2", 1),
+        raw("a=T,f=32,s=1,v=1,c=2,r=1,q=2", 2),
+        raw("a=t,f=32,s=1,v=1,i=5,q=2", 3),
+        raw("a=T,f=32,s=1,v=1,I=7,U=1,c=2,r=1,q=2", 4),
+        raw("a=T,f=32,s=1,v=1,i=8,U=1,c=2,r=1,q=2", 5),
+        b"\r\n\r\n".to_vec(),
+        b"\x1b_Ga=p,i=5,c=2,r=1,C=1,q=2\x1b\\".to_vec(),
+        b"\x1b_Ga=p,i=5,c=2,r=1,C=1,q=2\x1b\\".to_vec(),
+        b"\x1b[3;1H\x1b_Ga=p,i=5,p=1,c=2,r=1,C=1,q=2\x1b\\".to_vec(),
+        b"\x1b_Ga=p,i=5,p=2,P=5,Q=1,H=1,V=1,c=2,r=1,q=2\x1b\\".to_vec(),
+        b"\x1b[5;1H\x1b_Ga=p,i=5,p=1,c=2,r=1,C=1,q=2\x1b\\".to_vec(),
+        b"\n\n\n".repeat(10),
+        b"\x1b[3J".to_vec(),
+        b"\x1b_Ga=p,i=5,p=1,c=2,r=1,C=1,q=2\x1b\\".to_vec(),
+        b"\x1b_Ga=d,d=N,I=7,q=2\x1b\\".to_vec(),
+        b"\x1b[?1049h".to_vec(),
+        raw("a=T,f=32,s=1,v=1,i=9,c=2,r=1,C=1,q=2", 6),
+        b"\x1b_Ga=d,d=i,i=9,q=2\x1b\\".to_vec(),
+        raw("a=T,f=32,s=1,v=1,i=10,c=2,r=1,C=1,q=2", 7),
+        b"\x1b[?1049l".to_vec(),
+        b"\x1b[J".to_vec(),
+    ];
+    for at in 0..=steps.len() {
+        let (mut a, mut viewer) = (Terminal::new(80, 24, 1 << 20), Terminal::new(80, 24, 1 << 20));
+        for (n, step) in steps.iter().enumerate() {
+            if n == at {
+                viewer.write(&a.paint_keeping_images());
+                same_images(&a, &viewer, &format!("right after it, at step {at}"));
+            }
+            a.write(step);
+            viewer.write(step);
+        }
+        same_images(&a, &viewer, &format!("all the way on from step {at}"));
+    }
+}
+
+#[test]
+fn a_paint_keeping_images_says_nothing_of_them() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&chunked("a=T,f=100,i=1,c=2,r=1,q=2", &png_of(2, 2)));
+    a.write(&chunked("a=T,f=100,i=2,U=1,c=2,r=1,q=2", &png_of(2, 2)));
+    a.write(b"\x1b_Ga=t,m=1,i=3,q=2;AAAA\x1b\\");
+    let paint = a.paint_keeping_images();
+    for image_command in [&b"\x1b_G"[..], b"\x1b[2J", b"?1049"] {
+        assert_eq!(count(&paint, image_command), 0);
+    }
+}
+
+#[test]
+fn a_paint_keeping_images_restores_the_modes_it_resets() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    let live = b"\x1b[?1000h\x1b[?2004h\x1b[5;9Htext";
+    a.write(live);
+    let mut viewer = Terminal::new(80, 24, 1 << 20);
+    viewer.write(live);
+    viewer.write(&a.paint_keeping_images());
+    assert!(viewer.dec_mode(1000) && viewer.dec_mode(2004));
+    a.write(b"!");
+    viewer.write(b"!");
+    assert_eq!(viewer.plain_text(), a.plain_text(), "with the cursor where it was");
+}
+
+#[test]
+fn a_paint_keeping_images_leaves_every_placement_however_many() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    let mut live = chunked("a=t,f=100,i=1,q=2", &png_of(2, 2));
+    for placement in 1..=1025 {
+        live.extend(format!("\x1b_Ga=p,i=1,p={placement},c=1,r=1,C=1,q=2\x1b\\").as_bytes());
+    }
+    a.write(&live);
+    let mut viewer = Terminal::new(80, 24, 1 << 20);
+    viewer.write(&live);
+    viewer.write(&a.paint_keeping_images());
+    assert_eq!(viewer.image_placements().len(), 1025);
+    let paint = a.paint(0);
+    assert_eq!(count(&paint, b"a=p,"), 1024);
+    assert!(a.images_carried().refused, "where a replay can't, it says so");
+}
+
+#[test]
+fn where_images_are_changes_when_they_scroll_and_what_they_are_does_not() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    assert_eq!(a.image_places(), 0, "none");
+    a.write(&chunked("a=T,f=100,i=1,c=2,r=1,C=1,q=2", &png_of(2, 2)));
+    let (places, generation) = (a.image_places(), a.images_generation());
+    assert_ne!(places, 0);
+    a.write(b"text");
+    assert_eq!(a.image_places(), places);
+    a.write(&b"\r\n".repeat(30));
+    assert_ne!(a.image_places(), places);
+    assert_eq!(a.images_generation(), generation);
+    a.write(&chunked("a=T,f=100,i=2,c=2,r=1,C=1,q=2", &png_of(2, 2)));
+    let generation = a.images_generation();
+    a.write(b"\x1b[2J");
+    assert_ne!(a.images_generation(), generation, "a clear does what a command would");
+}
+
+#[test]
+fn an_icon_needs_no_encoder_and_anything_larger_does() {
+    let paint_of = |width: u32, height: u32| {
+        let mut a = Terminal::new(80, 24, 1 << 20);
+        a.write(&chunked(
+            &format!("a=T,f=32,s={width},v={height},i=1,c=2,r=1,C=1,q=2"),
+            &noise((width * height * 4) as usize),
+        ));
+        let _ = a.paint_ready(0);
+        a.images_carried().deferred
+    };
+    assert!(!paint_of(128, 128), "64 KiB of pixels");
+    assert!(paint_of(128, 129));
+}
+
+#[test]
+fn images_that_keep_being_replaced_do_not_keep_the_encoder_from_the_rest() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&dot("i=1,c=2,r=1,C=1", [1; 4]));
+    let replace_both = |a: &mut Terminal, byte: u8| {
+        a.write(&dot("i=2,c=2,r=1,C=1", [byte; 4]));
+        a.write(&dot("i=3,c=2,r=1,C=1", [byte; 4]));
+    };
+    for turn in 0..3 {
+        replace_both(&mut a, turn);
+        a.encoded(a.next_encode().unwrap().run());
+    }
+    assert!(carries_the_first(&a), "the one that holds still");
+
+    // And again, for one that changes just once, after all that.
+    a.write(&dot("i=1,c=2,r=1,C=1", [9; 4]));
+    for turn in 3..7 {
+        replace_both(&mut a, turn);
+        a.encoded(a.next_encode().unwrap().run());
+    }
+    assert!(carries_the_first(&a));
+}
+
+#[test]
+fn images_that_keep_being_new_do_not_keep_the_encoder_from_one_that_holds_still() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&dot("i=1,c=2,r=1,C=1", [1; 4]));
+    let mut encoded = false;
+    for fresh in 10..16u32 {
+        a.write(format!("\x1b_Ga=d,d=I,i={},q=2\x1b\\", fresh - 1).as_bytes());
+        a.write(&dot(&format!("i={fresh},c=2,r=1,C=1"), [fresh as u8; 4]));
+        a.write(&dot(&format!("i={},c=2,r=1,C=1", fresh + 100), [fresh as u8; 4]));
+        a.encoded(a.next_encode().unwrap().run());
+        encoded |= carries_the_first(&a);
+    }
+    assert!(encoded, "it gets a turn, however new the others are");
+}
+
+#[test]
+fn an_image_between_two_that_keep_changing_gets_its_turn() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&dot("i=1,c=2,r=1,C=1", [1; 4]));
+    let mut encoded = false;
+    for turn in 0..8u8 {
+        // Newest of the direct images, and a placeholder image, which always go after those.
+        a.write(&dot("i=2,c=2,r=1,C=1", [turn; 4]));
+        a.write(&dot("i=3,U=1,c=2,r=1", [turn; 4]));
+        a.encoded(a.next_encode().unwrap().run());
+        encoded |= carries_the_first(&a);
+    }
+    assert!(encoded);
+}
+
+#[test]
+fn what_has_waited_longest_gets_a_turn_whatever_keeps_changing_around_it() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    // Between the two in the order they're wanted, and older than either.
+    a.write(&dot("i=1,c=2,r=1,C=1", [1; 4]));
+    let mut encoded = false;
+    for turn in 0..1000u32 {
+        // Each change comes just after the encoder has taken its next job, and always the
+        // one that would put the list back as it was.
+        let which = if turn % 2 == 0 { 2 } else { 3 };
+        let byte = [turn as u8; 4];
+        a.write(&dot(&format!("i={which},c=2,r=1,C=1"), byte));
+        a.write(&dot("i=4,U=1,c=2,r=1", byte));
+        let job = a.next_encode().unwrap();
+        a.write(&dot(&format!("i={},c=2,r=1,C=1", 5 - which), byte));
+        a.encoded(job.run());
+        if carries_the_first(&a) {
+            encoded = true;
+            assert!(turn < 4, "took {turn} turns");
+            break;
+        }
+    }
+    assert!(encoded);
+}
+
+#[test]
+fn the_encoder_starts_on_what_is_wanted_most_each_time_it_starts() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    for id in [1, 2] {
+        a.write(&dot(&format!("i={id},c=2,r=1,C=1"), [1; 4]));
+    }
+    settle(&mut a, usize::MAX, "");
+    for id in [4, 5, 6] {
+        a.write(&dot(&format!("i={id},c=2,r=1,C=1"), [1; 4]));
+    }
+    assert_eq!(a.next_encode().unwrap().id(), 6, "the newest");
+}
+
+#[test]
+fn a_repaint_at_a_prompt_isnt_taken_for_more_of_the_prompt() {
+    // As a terminal does that lets the shell redraw its prompt, which clears from there on a resize.
+    let prompt = "\x1b]133;A\x07$ \x1b]133;B\x07";
+    let mut page = String::new();
+    for name in ["one", "two"] {
+        page += &format!("{prompt}{name}\r\n\x1b]133;C\x07");
+        page += &"line\r\n".repeat(if name == "one" { 5 } else { 60 });
+    }
+    page += prompt;
+    let mut screen = Terminal::new(80, 24, 1 << 20);
+    screen.write(page.as_bytes());
+    let nonblank = |t: &Terminal| t.screen_rows().iter().filter(|r| !r.trim().is_empty()).count();
+    for repaint in [screen.repaint(), screen.paint_keeping_images()] {
+        let mut viewer = Terminal::new(80, 24, 1 << 20);
+        viewer.write(b"\x1b]133;A;redraw=1\x07\x1b]133;C\x07\x1b[H\x1b[2J");
+        viewer.write(page.as_bytes());
+        viewer.write(&repaint);
+        viewer.resize(70, 20);
+        assert_eq!(nonblank(&viewer), 20);
+    }
 }
