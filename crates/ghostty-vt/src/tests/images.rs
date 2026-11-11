@@ -130,6 +130,26 @@ fn a_direct_image_keeps_a_pending_wrap_at_the_bottom_right() {
 }
 
 #[test]
+fn deleted_cleared_and_scrolled_off_images_are_not_painted() {
+    let cases: [&[u8]; 4] = [b"\x1b_Ga=d,d=I,i=1,q=2\x1b\\", b"\x1b[2J", b"\x1bc", &[b'\n'; 60]];
+    for case in cases {
+        let mut a = Terminal::new(80, 24, 1 << 20);
+        a.write(&small(1));
+        a.write(case);
+        assert_eq!(count(&a.repaint(), b"\x1b_G"), 2, "only clearing what the viewer has, after {case:?}");
+    }
+}
+
+#[test]
+fn a_terminal_that_never_saw_an_image_paints_none_and_keeps_nothing() {
+    let a = Terminal::new(80, 24, 1 << 20);
+    assert_eq!(count(&a.repaint(), b"\x1b_G"), 2, "only clearing what the viewer has");
+    assert_eq!(count(&a.paint(0), b"\x1b_G"), 1, "and on a first paint, nothing of what it may have");
+    assert_eq!(count(&a.paint_text(0), b"\x1b_G"), 1);
+    assert!(a.encoded[0].borrow().is_empty());
+}
+
+#[test]
 fn a_half_received_image_on_a_viewer_swallows_nothing_that_follows() {
     let open = chunked("a=T,f=32,s=600,v=600,i=77,q=2", &vec![7u8; 600 * 600 * 4]);
     let cut = open.windows(2).enumerate().filter(|(_, w)| *w == b"\x1b\\").nth(5).unwrap().0 + 2;
@@ -648,4 +668,45 @@ fn painting_the_alternate_screen_keeps_what_the_main_one_encoded() {
     kitty::tests::ENCODES.set(0);
     let _ = a.paint(0);
     assert_eq!(kitty::tests::ENCODES.get(), 0);
+}
+
+#[test]
+fn a_paint_says_what_it_carried_and_what_it_could_not() {
+    let mut a = Terminal::new(80, 24, 1 << 20);
+    a.write(&chunked("a=T,f=100,i=1,c=2,r=1,C=1,q=2", &png_of(2, 2)));
+    let _ = a.paint(0);
+    let first = a.images_carried();
+    let _ = a.paint(0);
+    assert_eq!(a.images_carried().images, first.images, "the same ones");
+    a.write(&chunked("a=T,f=100,i=2,c=2,r=1,C=1,q=2", &png_of(2, 2)));
+    let _ = a.paint(0);
+    assert_ne!(a.images_carried().images, first.images);
+    let second = a.images_carried().images;
+    a.write(&chunked("a=T,f=32,s=1,v=1,i=2,c=2,r=1,C=1,q=2", &[9; 4]));
+    let _ = a.paint(0);
+    assert_ne!(a.images_carried().images, second, "a replaced image is not what a viewer already has");
+    a.write(&chunked("a=T,f=32,s=1040,v=1040,i=3,c=2,r=1,C=1,q=2", &noise(1040 * 1040 * 4)));
+    let _ = a.paint(0);
+    assert!(a.images_carried().refused, "too big, for good");
+}
+
+#[test]
+fn a_repaint_at_a_marked_prompt_adds_nothing_to_a_viewers_history() {
+    // On the bottom row: that's where Ghostty looks for one.
+    let page = [&b"line\r\n".repeat(20)[..], b"\x1b]133;A\x07$ \x1b]133;B\x07"].concat();
+    let mut screen = Terminal::new(40, 10, 1 << 20);
+    screen.write(&page);
+    let mut viewer = Terminal::new(40, 10, 1 << 20);
+    viewer.write(&page);
+    let history = viewer.history_rows();
+    for _ in 0..3 {
+        viewer.write(&screen.repaint());
+        // Each comes with its own marks: stock's own paints leave those out too.
+        viewer.write(b"\x1b[10;1H\x1b]133;A\x07$ \x1b]133;B\x07");
+    }
+    assert_eq!(viewer.history_rows(), history);
+    let mut used = Terminal::new(40, 10, 1 << 20);
+    used.write(&page);
+    used.write(&screen.paint(0));
+    assert_eq!(used.history_rows(), history + 10, "a first paint scrolls what was there out of the way");
 }

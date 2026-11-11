@@ -207,14 +207,7 @@ impl Core {
             link.input(id, &held);
         }
         if st.screens.contains_key(&id) {
-            let paint = crate::viewers::first_paint(&st, id, 0);
-            let recovering = st.screens[&id].continuation().is_none();
-            for v in st.viewers.get_mut(&id).into_iter().flatten() {
-                v.recovering = recovering;
-                v.conn.with(|out| {
-                    out.data(v.channel, &paint);
-                });
-            }
+            self.repaint_after_read(&mut st, id);
         }
         let capture = result?;
         let answer = capture.answer(lines);

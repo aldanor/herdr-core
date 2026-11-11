@@ -779,7 +779,7 @@ impl Core {
         if let (Some(relay), Some(screen)) = (st.relays.get_mut(&id), st.screens.get_mut(&id)) {
             relay.flush(screen);
         }
-        self.queue_resize_paints(st, id, None);
+        self.queue_repaints(st, id, None);
         for v in st.viewers.remove(&id).unwrap_or_default() {
             v.conn.with(|out| out.finish(v.channel, end.to_string().as_bytes()));
         }

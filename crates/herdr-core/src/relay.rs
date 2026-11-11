@@ -194,7 +194,10 @@ impl Relay {
         if let Some(keep) = self.apc.take() {
             screen.drop_responses_after(keep);
         }
-        let paint = screen.paint_text(0);
+        // Output is still flowing: images wait for it to rest, like any other repaint's.
+        #[cfg(test)]
+        crate::viewers::tests::PAINTS.with(|n| n.set(n.get() + 1));
+        let paint = if screen.has_images() { screen.paint_text(0) } else { screen.repaint() };
         let mut out = bytes[..n].to_vec();
         out.extend(self.feed(screen, &bytes[n..]));
         (out, Some((n, paint)))
@@ -280,18 +283,64 @@ fn pass(screen: &mut Screen, out: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tmux_passthrough_goes_through_as_it_came() {
+        let short = b"\x1bPtmux;\x1b\x1b_Ga=T,f=32,s=1,v=1,i=1,q=2;AAAAAA==\x1b\x1b\\\x1b\\after".to_vec();
+        for stream in [short.clone(), [&b"\x1bPtmux;"[..], &short[7..24], &vec![b'A'; 5000], &short[24..]].concat()] {
+            let (mut relay, mut screen) = fed(b"");
+            assert_eq!(relay.feed(&mut screen, &stream), stream);
+            assert!(relay.held.is_empty());
+            for split in (1..stream.len()).step_by(37).chain(5000..5030) {
+                let split = split.min(stream.len() - 1);
+                let (mut relay, mut screen) = fed(b"");
+                let mut out = relay.feed(&mut screen, &stream[..split]);
+                out.extend(relay.feed(&mut screen, &stream[split..]));
+                assert_eq!(out, stream, "split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn viewers_get_every_byte_of_what_nothing_here_answers() {
+        const BYTES: &[u8] = b"\x1b\x1b\x1b\x1b[]P_\\Gx;1m\x07\x18=,a";
+        let mut state = 88172645463325252u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        for _ in 0..3000 {
+            let stream: Vec<u8> = (0..next() % 40).map(|_| BYTES[next() % BYTES.len()]).collect();
+            let split = next() % (stream.len() + 1);
+            let (mut relay, mut screen) = fed(b"");
+            let mut out = relay.feed(&mut screen, &stream[..split]);
+            out.extend(relay.feed(&mut screen, &stream[split..]));
+            out.extend_from_slice(&relay.held);
+            assert_eq!(out, stream);
+        }
+    }
+
+    fn fed(input: &[u8]) -> (Relay, Screen) {
+        let (mut relay, mut screen) = (Relay::default(), Screen::new(80, 24, 1 << 20));
+        relay.feed(&mut screen, input);
+        (relay, screen)
+    }
+
     fn feed_bytewise(relay: &mut Relay, screen: &mut Screen, input: &[u8]) -> Vec<u8> {
         input.iter().flat_map(|b| relay.feed(screen, std::slice::from_ref(b))).collect()
+    }
+
+    fn feed_either_way(bytewise: bool, relay: &mut Relay, screen: &mut Screen, input: &[u8]) -> Vec<u8> {
+        if bytewise { feed_bytewise(relay, screen, input) } else { relay.feed(screen, input) }
     }
 
     #[test]
     fn strips_only_the_queries_the_screen_answered() {
         for split in [false, true] {
-            let mut screen = Screen::new(80, 24, 1 << 20);
-            let mut relay = Relay::default();
+            let (mut relay, mut screen) = fed(b"");
             let input = b"hi \x1b[31mred\x1b[0m \x1b[c\x1b]11;?\x07\x1b[6n\x1bP+q544e\x1b\\\x1b]2;title\x07 end";
-            let out =
-                if split { feed_bytewise(&mut relay, &mut screen, input) } else { relay.feed(&mut screen, input) };
+            let out = feed_either_way(split, &mut relay, &mut screen, input);
             // Answered here: DA1, background color, cursor position. Not answered: XTGETTCAP.
             assert_eq!(
                 String::from_utf8_lossy(&out),
@@ -306,8 +355,7 @@ mod tests {
 
     #[test]
     fn resize_reports_are_dropped_but_query_answers_are_kept() {
-        let mut screen = Screen::new(80, 24, 1 << 20);
-        let mut relay = Relay::default();
+        let (mut relay, mut screen) = fed(b"");
         let out = relay.feed(&mut screen, b"\x1b[c\x1b[?2048h\x1b[6n");
         assert_eq!(out, b"\x1b[?2048h");
         screen.resize(100, 30);
@@ -321,11 +369,9 @@ mod tests {
         // answers. Two answers (the screen's EINVAL and the viewer's OK)
         // confused programs.
         for split in [false, true] {
-            let mut screen = Screen::new(80, 24, 1 << 20);
-            let mut relay = Relay::default();
+            let (mut relay, mut screen) = fed(b"");
             let input = b"a\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\b\x1b_Gi=7,a=T,f=100;iVBORw0KGgo=\x1b\\c\x1b[6n";
-            let out =
-                if split { feed_bytewise(&mut relay, &mut screen, input) } else { relay.feed(&mut screen, input) };
+            let out = feed_either_way(split, &mut relay, &mut screen, input);
             assert_eq!(
                 String::from_utf8_lossy(&out),
                 String::from_utf8_lossy(&input[..input.len() - 4]),
@@ -363,8 +409,7 @@ mod tests {
     fn recovery_finds_ground_between_images_even_when_every_read_ends_mid_image() {
         for opener in [b"\x1b_Gm=1;".as_slice(), b"\x1b]2;", b"\x1bPtmux;", b"\x1b^"] {
             for split_st in [false, true] {
-                let mut screen = Screen::new(80, 24, 1 << 20);
-                let mut relay = Relay::default();
+                let (mut relay, mut screen) = fed(b"");
                 let mut prefix = b"before\r\n".to_vec();
                 prefix.extend_from_slice(opener);
                 prefix.extend(vec![b'A'; 70_000]);
@@ -478,8 +523,7 @@ mod tests {
 
     #[test]
     fn long_strings_pass_through_untouched() {
-        let mut screen = Screen::new(80, 24, 1 << 20);
-        let mut relay = Relay::default();
+        let (mut relay, mut screen) = fed(b"");
         let long = format!("\x1b]52;c;{}?\x07after", "A".repeat(2000));
         let out = feed_bytewise(&mut relay, &mut screen, long.as_bytes());
         assert_eq!(out, long.as_bytes());

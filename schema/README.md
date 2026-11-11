@@ -103,8 +103,9 @@ behavior: no additional resize paints or RESIZE frames.
 
 Flow control: a stream starts with 256 KiB of credit. The viewer sends
 CREDIT for the bytes it has written out. A viewer that falls more than
-4 MiB behind gets a fresh repaint, without images, instead of the backlog.
-The first paint never counts as falling behind, whatever its size. A stalled stream
+4 MiB behind gets a fresh repaint instead of the backlog, once it has credit
+for one; its images come once output rests for 100 ms, or after 2 s if it never does.
+A paint never counts as falling behind, whatever its size. A stalled stream
 never blocks channel 0 or other streams.
 
 A viewer detaches by sending CLOSE; the core answers with an empty CLOSE.

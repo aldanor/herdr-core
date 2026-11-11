@@ -5,6 +5,7 @@ use super::{Terminal, ffi};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -249,10 +250,20 @@ pub(crate) enum Encoded {
 /// Commands that put a screen's images on a viewer.
 #[derive(Default)]
 pub(crate) struct Replay {
+    pub carried: Carried,
     /// Need the cursor: they go before the screen's modes are final.
     pub direct: Vec<u8>,
     /// Don't: they follow the whole screen, so it never waits for large ones. Output after them does.
     pub placeholder: Vec<u8>,
+}
+
+/// What a paint with images brought a viewer, and what it couldn't.
+#[derive(Clone, Copy, Default)]
+pub struct Carried {
+    /// Which images: two paints with the same ones can only differ in what's live anyway.
+    pub images: u64,
+    /// Some on screen stayed behind for lack of room.
+    pub refused: bool,
 }
 
 impl Terminal {
@@ -281,6 +292,8 @@ impl Terminal {
 
     /// The active screen's placements.
     pub(crate) fn placements(&self) -> Vec<ImagePlacement> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.placement_walks.set(self.placement_walks.get() + 1);
         let graphics = self.graphics();
         let mut out = Vec::new();
         unsafe {
@@ -318,14 +331,44 @@ impl Terminal {
     }
 
     /// Whether a paint without images would leave any out.
-    pub(crate) fn has_images(&self) -> bool {
+    pub fn has_images(&self) -> bool {
         self.placements().iter().any(|p| p.virtual_ || p.visible)
+    }
+
+    pub(crate) fn images_vt(&self) -> Replay {
+        let replay = self.images_walk(PAINT_BYTES, true);
+        self.carried.set(replay.carried);
+        replay
+    }
+
+    /// Whether a viewer has to place any image by where the text left it.
+    pub fn direct_images_in_view(&self) -> bool {
+        self.placements().iter().any(|p| !p.virtual_ && p.visible)
+    }
+
+    /// What the last paint with images carried, or what a look at the images found a
+    /// paint now would (`images_ready`).
+    pub fn images_carried(&self) -> Carried {
+        self.carried.get()
+    }
+
+    /// Finds what a paint now would carry (`images_carried`).
+    pub fn look_at_images(&self) {
+        self.carried.set(self.images_walk(PAINT_BYTES, false).carried);
+    }
+
+    /// How many times the placements have been walked. For tests: with hundreds of them
+    /// a walk takes real time, and program output mustn't pay for one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn placement_walks(&self) -> u64 {
+        self.placement_walks.get()
     }
 
     /// The commands for the images on screen, within `budget` bytes. Each image goes whole
     /// or not at all: direct ones on screen first, then placeholder ones, newest first in
-    /// each, as the screen itself evicts.
-    pub(crate) fn images_walk(&self, budget: usize) -> Replay {
+    /// each, as the screen itself evicts. `emit`: copy out the commands too, not just find
+    /// out what they'd be.
+    pub(crate) fn images_walk(&self, budget: usize, emit: bool) -> Replay {
         let placements = self.placements();
         let newest = |p: &&ImagePlacement| Reverse(self.image(p.image).map_or(0, |i| i.generation));
         let mut direct: Vec<&ImagePlacement> = placements.iter().filter(|p| !p.virtual_ && p.visible).collect();
@@ -340,6 +383,8 @@ impl Terminal {
         let mut placements_left = PAINT_PLACEMENTS;
         let mut sent = HashSet::new();
         let mut refused = HashSet::new();
+        let mut placements_refused = false;
+        let mut carried = Vec::new();
         let mut replay = Replay::default();
         let cell = self.hooks.cell;
         for (list, out) in [(&direct, &mut replay.direct), (&placeholder, &mut replay.placeholder)] {
@@ -369,17 +414,26 @@ impl Terminal {
                     placements_left -= 1;
                     left -= command.len();
                     placed.extend(command);
+                } else {
+                    placements_refused = true;
                 }
             }
             // Oldest first: a viewer short of room then lets the same ones go as the screen did.
             for generation in newest_first.iter().rev() {
-                if let Some(Encoded::Commands(commands)) = kept.get(generation) {
+                if emit && let Some(Encoded::Commands(commands)) = kept.get(generation) {
                     out.extend_from_slice(commands);
                 }
+                carried.push(*generation);
             }
-            out.extend(placed);
+            if emit {
+                out.extend(placed);
+            }
         }
         *cache = kept;
+        carried.sort_unstable();
+        let mut images = std::collections::hash_map::DefaultHasher::new();
+        carried.hash(&mut images);
+        replay.carried = Carried { images: images.finish(), refused: placements_refused || !refused.is_empty() };
         replay
     }
 }

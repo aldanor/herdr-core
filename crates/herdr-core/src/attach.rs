@@ -21,7 +21,8 @@ const ASK_DISPLAY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b[1
 /// modes back to their defaults, scroll region, cursor, charset, colors.
 /// Origin mode and the scroll region move the cursor home, so the position
 /// is saved around them: the next prompt follows the program's last line.
-const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049h\x1b[=0;1u\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[=0;1u\x1b[>4;0m\
+const RESET: &[u8] =
+    b"\x1b_Gq=2,m=0;\x1b\\\x1b[?2026l\x1b[?1049h\x1b[=0;1u\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[=0;1u\x1b[>4;0m\
 \x1b7\x1b[4l\x1b[20l\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?66l\x1b[?67l\x1b[?69l\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\
 \x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2031l\x1b[?2033l\
 \x1b[?2048l\x1b[?7h\x1b[?25h\x1b[?1007h\x1b[r\x1b8\x1b[0 q\x1b(B\x1b[0m\
@@ -411,6 +412,32 @@ mod tests {
         t.write(&shown(b"\xb8\x8a B"));
         assert_eq!(t.plain_text().trim_end(), "A 上 B");
         assert!(t.dec_mode(1004));
+    }
+
+    #[test]
+    fn turning_focus_reports_back_on_never_lands_inside_a_sequence_the_frame_ends_in() {
+        let frame = b"\x1b[?1004l\x1b_Gm=1;AAAA";
+        assert_eq!(&*shown(frame), b"\x1b[?1004h\x1b_Gm=1;AAAA");
+        assert_eq!(&*shown(b"\x1b[?1004lhi\x1b[?1004l"), b"\x1b[?1004hhi\x1b[?1004h");
+    }
+
+    #[test]
+    fn detaching_mid_image_leaves_the_terminal_ready_for_the_next_one() {
+        let pixel = "AAAAAA==";
+        for alt in [false, true] {
+            let mut t = ghostty_vt::Terminal::new(80, 24, 1 << 20);
+            if alt {
+                t.write(b"\x1b[?1049h");
+            }
+            t.write(b"\x1b_Ga=t,f=32,s=1,v=1,i=1,m=1;AAAA");
+            t.write(RESET);
+            assert!(!t.alt_screen(), "the rest of the reset still ran");
+            if alt {
+                t.write(b"\x1b[?1049h");
+            }
+            t.write(format!("\x1b_Ga=T,f=32,s=1,v=1,i=2;{pixel}\x1b\\").as_bytes());
+            assert_eq!(t.image_placements().iter().map(|p| p.image).collect::<Vec<_>>(), [2], "alt: {alt}");
+        }
     }
 
     #[test]

@@ -6,11 +6,13 @@ use crate::paths::Paths;
 use crate::platform::{self, AsyncListener};
 use crate::rpc::{self, RpcError};
 use crate::runtime::Core;
+use crate::viewers::IMAGES_REST;
 use crate::wire::{self, Conn};
 use serde_json::Value;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 tokio::task_local! {
@@ -329,14 +331,33 @@ pub fn heartbeat(core: Arc<Core>, conn: Arc<Conn>, channel: u32) {
 
 /// Sends whatever the outbox hands out: control first, then streams by credit.
 async fn write_frames(core: Arc<Core>, conn: Arc<Conn>, mut write: Writer) -> io::Result<()> {
+    let mut look_again = None;
     loop {
-        conn.wake.notified().await;
-        core.prepare_repaints(&conn);
+        match look_again {
+            // Nothing else wakes us when output rests: that's the absence of anything.
+            Some(wait) => drop(tokio::time::timeout(wait, conn.wake.notified()).await),
+            None => conn.wake.notified().await,
+        }
+        // Around again after sending anything: a paint going out holds up what's due after it,
+        // and with credit to spare, nothing else would say when it has gone.
         loop {
-            let next = conn.outbox().next_frame();
-            match next {
-                Some(frame) => write.write_all(&frame).await?,
-                None => break,
+            look_again = core.prepare_repaints(&conn);
+            let (mut sent, mut looked) = (false, Instant::now());
+            loop {
+                let next = conn.outbox().next_frame();
+                match next {
+                    Some(frame) => write.write_all(&frame).await?,
+                    None => break,
+                }
+                sent = true;
+                // However busy another channel on this connection, paints come when they're due.
+                if looked.elapsed() >= IMAGES_REST {
+                    look_again = core.prepare_repaints(&conn);
+                    looked = Instant::now();
+                }
+            }
+            if !sent {
+                break;
             }
         }
     }
@@ -516,6 +537,141 @@ async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn test_core() -> (Arc<Core>, std::path::PathBuf) {
+        let root = std::path::PathBuf::from(format!("/var/tmp/hc-writer-{}", platform::random_hex()));
+        let paths = Paths {
+            socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
+            state: root.clone(),
+            config: root.join("config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        (Core::start(paths, CoreInfo { id: "test".into(), name: "test".into() }).unwrap(), root)
+    }
+
+    /// A shell terminal whose screen is `screen`.
+    #[cfg(unix)]
+    fn shell_with(core: &Core, screen: ghostty_vt::Terminal) -> u32 {
+        let new = crate::terminals::NewTerminal { argv: vec!["sh".into()], cols: 80, rows: 24, ..Default::default() };
+        let mut st = core.lock();
+        let id = st.reg.create(new, 0).unwrap();
+        st.screens.insert(id, screen);
+        id
+    }
+
+    #[cfg(unix)]
+    fn attach(core: &Core, conn: &Arc<Conn>, id: u32) -> u32 {
+        let request = crate::viewers::AttachRequest {
+            observe: false,
+            resize_notifications: false,
+            history: 0,
+            size: (80, 24),
+            display: Default::default(),
+            resumed: false,
+        };
+        core.attach(conn, id, request).unwrap()
+    }
+
+    /// Reads frames from a writer on `conn`, in the background.
+    #[cfg(unix)]
+    fn writing(
+        core: &Arc<Core>,
+        conn: &Arc<Conn>,
+    ) -> (tokio::task::JoinHandle<io::Result<()>>, tokio::net::unix::OwnedReadHalf) {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let (_, write) = server.into_split();
+        let (read, _) = client.into_split();
+        (tokio::spawn(write_frames(core.clone(), conn.clone(), write)), read)
+    }
+
+    /// A writer serving a viewer that doesn't send any credit back: the one in the window will do.
+    #[cfg(unix)]
+    struct Quiet {
+        core: Arc<Core>,
+        conn: Arc<Conn>,
+        id: u32,
+        root: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Quiet {
+        fn start() -> Quiet {
+            let (core, root) = test_core();
+            let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
+            for image in 11..=14 {
+                screen.write(format!("\x1b_Ga=T,f=32,s=1,v=1,i={image},c=2,r=1,C=1,q=2;AAAAAA==\x1b\\").as_bytes());
+            }
+            let id = shell_with(&core, screen);
+            let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            core.lock().last_output.insert(id, long_ago);
+            let conn = Arc::new(Conn::default());
+            let channel = attach(&core, &conn, id);
+            conn.with(|out| out.resume(channel));
+            Quiet { core, conn, id, root }
+        }
+
+        /// What its writer sends, until `enough` of it or a second of silence.
+        async fn sends(&self, enough: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+            let (writer, mut reader) = writing(&self.core, &self.conn);
+            self.conn.wake.notify_one();
+            let mut got = Vec::new();
+            let silence = std::time::Duration::from_secs(1);
+            while !enough(&got)
+                && let Ok(Ok(Some((_, wire::DATA, bytes)))) =
+                    tokio::time::timeout(silence, wire::read_frame(&mut reader)).await
+            {
+                got.extend(bytes);
+            }
+            writer.abort();
+            got
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_repaint_waiting_for_a_paint_follows_it_with_no_credit_coming_back() {
+        // All encoded on the spot: the encoder finishing would wake the writer too.
+        let quiet = Quiet::start();
+        quiet.core.lock().screens.get_mut(&quiet.id).unwrap().write(b"\x1b[Hafterwards");
+        quiet.core.repaint_after_read(&mut quiet.core.lock(), quiet.id);
+        let has_it = |got: &[u8]| got.windows(10).any(|w| w == b"afterwards");
+        assert!(has_it(&quiet.sends(has_it).await));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_behind_a_paint_on_its_way_gets_its_repaint_with_no_more_credit() {
+        let (core, root) = test_core();
+        let id = shell_with(&core, ghostty_vt::Terminal::new(80, 24, 1 << 20));
+        let conn = Arc::new(Conn::default());
+        let channel = attach(&core, &conn, id);
+        conn.with(|out| {
+            out.resume(channel);
+            while out.next_frame().is_some() {}
+            out.paint(channel, b"old paint");
+            out.credit(channel, wire::WINDOW);
+        });
+        core.repaint_after_read(&mut core.lock(), id);
+        let (writer, mut read) = writing(&core, &conn);
+        conn.wake.notify_one();
+        let first = wire::read_frame(&mut read).await.unwrap().unwrap();
+        assert_eq!(first.2, b"old paint");
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), wire::read_frame(&mut read)).await;
+        writer.abort();
+        core.lock().viewers.clear();
+        let _ = std::fs::remove_dir_all(&root);
+        let next = next.expect("the writer left the repaint behind the old paint").unwrap().unwrap();
+        assert_eq!((next.0, next.1, next.2.first()), (channel, wire::DATA, Some(&0x18)));
+    }
 
     #[test]
     fn a_disk_under_another_machine_id_is_a_new_machine_without_the_old_ones_life() {

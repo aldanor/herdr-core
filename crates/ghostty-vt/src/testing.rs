@@ -17,7 +17,7 @@ impl Terminal {
 
     #[cfg(test)]
     pub(crate) fn images_within(&self, budget: usize) -> crate::kitty::Replay {
-        self.images_walk(budget)
+        self.images_walk(budget, true)
     }
 }
 

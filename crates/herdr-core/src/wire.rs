@@ -211,6 +211,11 @@ impl Outbox {
         self.streams.get(&channel).is_some_and(|s| !s.paused && s.credit > 0)
     }
 
+    /// Whether a repaint can start: there's credit for it and none is still going out.
+    pub fn can_paint(&self, channel: u32) -> bool {
+        self.can_send(channel) && self.streams.get(&channel).is_some_and(|s| s.paint_left == 0)
+    }
+
     /// Supersede pending output with a new grid and an authoritative repaint.
     /// A partly delivered escape sequence is cancelled by the repaint's CAN.
     pub fn resize(&mut self, channel: u32, size: &[u8]) {
@@ -249,7 +254,8 @@ impl Outbox {
     pub fn data(&mut self, channel: u32, bytes: &[u8]) -> bool {
         let Some(s) = self.streams.get_mut(&channel) else { return true };
         if s.pending.len() + bytes.len() > MAX_PENDING + s.paint_left {
-            // A first paint on its way finishes. Only what followed it goes.
+            // A paint already on its way finishes: starting over would never end
+            // for a viewer slower than the program. Only what followed it goes.
             s.pending.truncate(s.paint_left);
             let latest = s.resizes.pop_back();
             s.resizes.clear();
@@ -262,11 +268,13 @@ impl Outbox {
         true
     }
 
-    /// Queues a first paint, of any size: only what queues up after it can mean falling behind.
+    /// Queues a paint in place of what was queued (it starts with CAN and says
+    /// everything). Any size: only what queues up after it can mean falling behind.
     pub fn paint(&mut self, channel: u32, bytes: &[u8]) {
         let Some(s) = self.streams.get_mut(&channel) else { return };
+        s.pending.clear();
         s.pending.extend(bytes);
-        s.paint_left = s.pending.len();
+        s.paint_left = bytes.len();
     }
 
     /// `data` for a stream of whole lines (events): too far behind, it keeps
@@ -325,6 +333,10 @@ impl Outbox {
         s.credit -= n;
         s.paint_left = s.paint_left.saturating_sub(n);
         let chunk: Vec<u8> = s.pending.drain(..n).collect();
+        // A paint can be large: an idle stream shouldn't keep its buffer.
+        if s.pending.is_empty() && s.pending.capacity() > WINDOW {
+            s.pending = VecDeque::new();
+        }
         Some(encode(channel, DATA, &chunk))
     }
 }
@@ -332,6 +344,103 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn drain(out: &mut Outbox) -> usize {
+        let mut sent = 0;
+        while let Some(frame) = out.next_frame() {
+            sent += frame.len() - HEADER;
+        }
+        sent
+    }
+
+    /// Stream 1, open, with all the credit it could want.
+    fn flowing() -> Outbox {
+        let mut out = Outbox::default();
+        out.open(1);
+        out.credit(1, usize::MAX / 2);
+        out
+    }
+
+    #[test]
+    fn a_paint_is_kept_whatever_its_size_and_only_what_follows_it_counts_as_behind() {
+        let mut out = Outbox::default();
+        out.open(1);
+        out.paint(1, &vec![b'p'; MAX_PENDING * 2]);
+        assert!(out.data(1, &vec![b'x'; MAX_PENDING]), "4 MiB may queue behind a paint");
+        assert!(!out.data(1, b"y"), "one byte more is falling behind");
+        out.credit(1, usize::MAX / 2);
+        assert_eq!(drain(&mut out), MAX_PENDING * 2, "the paint arrives whole, without what followed it");
+    }
+
+    #[test]
+    fn a_paint_replaces_what_was_queued_so_repeated_paints_do_not_grow_the_queue() {
+        let mut out = Outbox::default();
+        out.open(1);
+        assert!(out.data(1, b"old"));
+        for _ in 0..10 {
+            out.paint(1, &vec![b'p'; MAX_PENDING]);
+        }
+        out.credit(1, usize::MAX / 2);
+        assert_eq!(drain(&mut out), MAX_PENDING);
+        assert!(out.can_paint(1), "the last one is out");
+    }
+
+    #[test]
+    fn a_new_paint_waits_until_the_last_one_has_gone_out() {
+        let mut out = Outbox::default();
+        out.open(1);
+        out.paint(1, &vec![b'p'; WINDOW * 2]);
+        assert!(!out.can_paint(1));
+        drain(&mut out);
+        assert!(!out.can_paint(1), "no credit left, and half the paint still queued");
+        out.credit(1, usize::MAX / 2);
+        assert!(!out.can_paint(1), "credit, but the paint hasn't finished");
+        drain(&mut out);
+        assert!(out.can_paint(1));
+    }
+
+    #[test]
+    fn a_paint_is_on_its_way_until_the_viewer_says_it_has_it() {
+        let mut out = Outbox::default();
+        out.open(1);
+        out.data(1, b"before");
+        drain(&mut out);
+        out.paint(1, b"paint");
+        drain(&mut out);
+        out.credit(1, 6);
+        out.credit(1, 5);
+        out.data(1, b"after");
+        drain(&mut out);
+    }
+
+    #[test]
+    fn what_a_paint_replaces_is_no_longer_queued() {
+        let mut out = Outbox::default();
+        out.open_paused(1);
+        out.resume(1);
+        out.paint(1, b"a paint");
+        out.paint(1, b"images");
+        drain(&mut out);
+    }
+
+    #[test]
+    fn a_resize_ends_the_paint_it_supersedes() {
+        let mut out = Outbox::default();
+        out.open(1);
+        out.paint(1, &vec![b'p'; MAX_PENDING * 2]);
+        out.resize(1, b"size");
+        assert!(out.can_paint(1), "the repaint can start right away");
+        assert!(out.data(1, &vec![b'x'; MAX_PENDING]));
+        assert!(!out.data(1, b"y"), "and the old paint no longer widens the limit");
+    }
+
+    #[test]
+    fn a_stream_gives_its_buffer_back_once_a_large_paint_has_gone_out() {
+        let mut out = flowing();
+        out.paint(1, &vec![b'p'; MAX_PENDING]);
+        drain(&mut out);
+        assert!(out.streams[&1].pending.capacity() <= WINDOW);
+    }
 
     #[test]
     fn resize_replaces_stalled_and_partially_sent_paints_atomically() {
